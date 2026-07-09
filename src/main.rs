@@ -268,8 +268,8 @@ fn playing_keyboard_shortcuts(
 
 fn update_board_visuals(
     gameplay: Res<Gameplay>,
-    mut cells: Query<(&Cell, &mut Sprite)>,
-    mut stones: Query<(&StoneVisual, &mut Sprite, &mut Transform)>,
+    mut cells: Query<(&Cell, &mut Sprite), Without<StoneVisual>>,
+    mut stones: Query<(&StoneVisual, &mut Sprite, &mut Transform), Without<Cell>>,
 ) {
     for (cell, mut sprite) in &mut cells {
         let mut color = Color::srgb(0.23, 0.23, 0.23);

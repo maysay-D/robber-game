@@ -80,6 +80,11 @@ struct StoneVisual {
     position: Position,
 }
 
+#[derive(Component)]
+struct StoneCountText {
+    position: Position,
+}
+
 fn main() {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.08)))
@@ -186,6 +191,18 @@ fn setup_game(mut commands: Commands, settings: Res<TitleSettings>) {
                 StoneVisual { position: p },
                 GameEntity,
             ));
+
+            commands.spawn((
+                Text2d::new("1"),
+                TextFont {
+                    font_size: FontSize::Px(CELL_SIZE * 0.32),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.93, 0.93, 0.93)),
+                Transform::from_translation(board_to_world(p, settings.board_size, 3.0)),
+                StoneCountText { position: p },
+                GameEntity,
+            ));
         }
     }
 
@@ -270,6 +287,7 @@ fn update_board_visuals(
     gameplay: Res<Gameplay>,
     mut cells: Query<(&Cell, &mut Sprite), Without<StoneVisual>>,
     mut stones: Query<(&StoneVisual, &mut Sprite, &mut Transform), Without<Cell>>,
+    mut stone_texts: Query<(&StoneCountText, &mut Text2d), Without<Cell>>,
 ) {
     for (cell, mut sprite) in &mut cells {
         let mut color = Color::srgb(0.23, 0.23, 0.23);
@@ -283,11 +301,21 @@ fn update_board_visuals(
         let height = gameplay.board.stack_at(stone.position);
         if height == 0 {
             sprite.color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+            transform.scale = Vec3::ONE;
             continue;
         }
         sprite.color = Color::srgb(0.04, 0.04, 0.04);
         let scale = 0.45 + (height as f32).sqrt() * 0.2;
         transform.scale = Vec3::splat(scale.min(1.7));
+    }
+
+    for (stone_text, mut text) in &mut stone_texts {
+        let height = gameplay.board.stack_at(stone_text.position);
+        text.0 = if height == 0 {
+            String::new()
+        } else {
+            height.to_string()
+        };
     }
 }
 

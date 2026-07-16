@@ -40,8 +40,9 @@ impl GameBoard {
         }
         let from_idx = self.index(from);
         let to_idx = self.index(to);
-        self.cells[from_idx] -= 1;
-        self.cells[to_idx] += 1;
+        let moving = self.cells[from_idx];
+        self.cells[from_idx] = 0;
+        self.cells[to_idx] += moving;
         true
     }
 
@@ -117,6 +118,15 @@ mod tests {
     }
 
     #[test]
+    fn move_transfers_entire_stack() {
+        let mut board = GameBoard::new_filled(3);
+        assert!(board.apply_move(Position { x: 0, y: 0 }, Position { x: 1, y: 0 }));
+        assert!(board.apply_move(Position { x: 1, y: 0 }, Position { x: 2, y: 0 }));
+        assert_eq!(board.stack_at(Position { x: 1, y: 0 }), 0);
+        assert_eq!(board.stack_at(Position { x: 2, y: 0 }), 3);
+    }
+
+    #[test]
     fn move_requires_adjacent_occupied_destination() {
         let mut board = GameBoard::new_filled(2);
         assert!(!board.apply_move(Position { x: 0, y: 0 }, Position { x: 1, y: 1 }));
@@ -129,7 +139,6 @@ mod tests {
         let mut board = GameBoard::new_filled(2);
         assert!(board.apply_move(Position { x: 0, y: 0 }, Position { x: 1, y: 0 }));
         assert!(board.apply_move(Position { x: 0, y: 1 }, Position { x: 1, y: 1 }));
-        assert!(board.apply_move(Position { x: 1, y: 1 }, Position { x: 1, y: 0 }));
         assert!(board.apply_move(Position { x: 1, y: 1 }, Position { x: 1, y: 0 }));
         assert!(!board.has_legal_move());
     }

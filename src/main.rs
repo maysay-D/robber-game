@@ -18,7 +18,8 @@ enum AppState {
 
 #[derive(Resource)]
 struct TitleSettings {
-    board_size: usize,
+    board_width: usize,
+    board_height: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,7 +89,10 @@ struct StoneCountText {
 fn main() {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.08)))
-        .insert_resource(TitleSettings { board_size: 6 })
+        .insert_resource(TitleSettings {
+            board_width: 5,
+            board_height: 6,
+        })
         .add_plugins(DefaultPlugins)
         .init_state::<AppState>()
         .add_systems(Startup, setup_camera)
@@ -138,10 +142,22 @@ fn title_input_system(
     mut settings: ResMut<TitleSettings>,
 ) {
     if keyboard.just_pressed(KeyCode::ArrowUp) || keyboard.just_pressed(KeyCode::Equal) {
-        settings.board_size = (settings.board_size + 1).min(TITLE_MAX_SIZE);
+        settings.board_height = (settings.board_height + 1).min(TITLE_MAX_SIZE);
     }
     if keyboard.just_pressed(KeyCode::ArrowDown) || keyboard.just_pressed(KeyCode::Minus) {
-        settings.board_size = settings.board_size.saturating_sub(1).max(TITLE_MIN_SIZE);
+        settings.board_height = settings
+            .board_height
+            .saturating_sub(1)
+            .max(TITLE_MIN_SIZE);
+    }
+    if keyboard.just_pressed(KeyCode::ArrowRight) {
+        settings.board_width = (settings.board_width + 1).min(TITLE_MAX_SIZE);
+    }
+    if keyboard.just_pressed(KeyCode::ArrowLeft) {
+        settings.board_width = settings
+            .board_width
+            .saturating_sub(1)
+            .max(TITLE_MIN_SIZE);
     }
     if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
         next_state.set(AppState::Playing);
@@ -153,14 +169,18 @@ fn update_title_window(
     settings: Res<TitleSettings>,
 ) {
     window.title = format!(
-        "Robber Game | タイトル: 盤面サイズ {} (↑/↓で変更, Enterで開始)",
-        settings.board_size
+        "Robber Game | タイトル: 盤面サイズ {}x{} (↑/↓:高さ, ←/→:幅, Enterで開始)",
+        settings.board_width,
+        settings.board_height
     );
 }
 
 fn setup_game(mut commands: Commands, settings: Res<TitleSettings>) {
-    let board = GameBoard::new_filled(settings.board_size);
-    let board_extent = board_extent(board.size());
+    let board = GameBoard::new_filled(settings.board_width, settings.board_height);
+    let board_width = board.width();
+    let board_height = board.height();
+    let board_pixel_width = board_extent(board_width);
+    let board_pixel_height = board_extent(board_height);
     commands.insert_resource(Gameplay {
         board,
         turn: PlayerTurn::First,
@@ -175,19 +195,19 @@ fn setup_game(mut commands: Commands, settings: Res<TitleSettings>) {
         GameEntity,
     ));
 
-    for y in 0..settings.board_size {
-        for x in 0..settings.board_size {
+    for y in 0..board_height {
+        for x in 0..board_width {
             let p = Position { x, y };
             commands.spawn((
                 Sprite::from_color(Color::srgb(0.23, 0.23, 0.23), Vec2::splat(CELL_SIZE - 3.0)),
-                Transform::from_translation(board_to_world(p, settings.board_size, -10.0)),
+                Transform::from_translation(board_to_world(p, board_width, board_height, -10.0)),
                 Cell { position: p },
                 GameEntity,
             ));
 
             commands.spawn((
                 Sprite::from_color(Color::srgb(0.08, 0.08, 0.08), Vec2::splat(CELL_SIZE * 0.56)),
-                Transform::from_translation(board_to_world(p, settings.board_size, 1.0)),
+                Transform::from_translation(board_to_world(p, board_width, board_height, 1.0)),
                 StoneVisual { position: p },
                 GameEntity,
             ));
@@ -199,7 +219,7 @@ fn setup_game(mut commands: Commands, settings: Res<TitleSettings>) {
                     ..default()
                 },
                 TextColor(Color::srgb(0.93, 0.93, 0.93)),
-                Transform::from_translation(board_to_world(p, settings.board_size, 3.0)),
+                Transform::from_translation(board_to_world(p, board_width, board_height, 3.0)),
                 StoneCountText { position: p },
                 GameEntity,
             ));
@@ -209,7 +229,7 @@ fn setup_game(mut commands: Commands, settings: Res<TitleSettings>) {
     commands.spawn((
         Sprite::from_color(
             Color::srgba(1.0, 1.0, 1.0, 0.06),
-            Vec2::new(board_extent + CELL_SIZE, board_extent + CELL_SIZE),
+            Vec2::new(board_pixel_width + CELL_SIZE, board_pixel_height + CELL_SIZE),
         ),
         Transform::from_xyz(0.0, 0.0, -20.0),
         GameEntity,
@@ -246,7 +266,11 @@ fn handle_play_clicks(
     let Some(world_position) = camera.viewport_to_world_2d(camera_transform, cursor).ok() else {
         return;
     };
-    let Some(clicked_cell) = world_to_board(world_position, gameplay.board.size()) else {
+    let Some(clicked_cell) = world_to_board(
+        world_position,
+        gameplay.board.width(),
+        gameplay.board.height(),
+    ) else {
         gameplay.selected = None;
         return;
     };
@@ -339,8 +363,8 @@ fn update_game_window_title(
         window.title = format!(
             "Robber Game | {} の手番をハイライト中 (盤面 {}x{})",
             gameplay.turn.label(),
-            gameplay.board.size(),
-            gameplay.board.size()
+            gameplay.board.width(),
+            gameplay.board.height()
         );
     }
 }
@@ -349,18 +373,20 @@ fn board_extent(size: usize) -> f32 {
     size as f32 * CELL_SIZE
 }
 
-fn board_to_world(pos: Position, size: usize, z: f32) -> Vec3 {
-    let half = board_extent(size) / 2.0;
-    let x = (pos.x as f32 + 0.5) * CELL_SIZE - half;
-    let y = (pos.y as f32 + 0.5) * CELL_SIZE - half;
+fn board_to_world(pos: Position, width: usize, height: usize, z: f32) -> Vec3 {
+    let half_width = board_extent(width) / 2.0;
+    let half_height = board_extent(height) / 2.0;
+    let x = (pos.x as f32 + 0.5) * CELL_SIZE - half_width;
+    let y = (pos.y as f32 + 0.5) * CELL_SIZE - half_height;
     Vec3::new(x, y, z)
 }
 
-fn world_to_board(world: Vec2, size: usize) -> Option<Position> {
-    let half = board_extent(size) / 2.0;
-    let x = ((world.x + half) / CELL_SIZE).floor() as isize;
-    let y = ((world.y + half) / CELL_SIZE).floor() as isize;
-    if x < 0 || y < 0 || x >= size as isize || y >= size as isize {
+fn world_to_board(world: Vec2, width: usize, height: usize) -> Option<Position> {
+    let half_width = board_extent(width) / 2.0;
+    let half_height = board_extent(height) / 2.0;
+    let x = ((world.x + half_width) / CELL_SIZE).floor() as isize;
+    let y = ((world.y + half_height) / CELL_SIZE).floor() as isize;
+    if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
         return None;
     }
     Some(Position {

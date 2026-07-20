@@ -38,7 +38,10 @@ impl GameBoard {
         if !self.in_bounds(from) || !self.in_bounds(to) || from == to {
             return false;
         }
-        self.is_adjacent(from, to) && self.stack_at(from) > 0 && self.stack_at(to) > 0
+        self.is_adjacent(from, to)
+            && self.stack_at(from) > 0
+            && self.stack_at(to) > 0
+            && self.stack_at(from) >= self.stack_at(to)
     }
 
     pub fn apply_move(&mut self, from: Position, to: Position) -> bool {
@@ -61,7 +64,7 @@ impl GameBoard {
                     continue;
                 }
                 for neighbor in self.neighbors(pos) {
-                    if self.stack_at(neighbor) > 0 {
+                    if self.can_move(pos, neighbor) {
                         return true;
                     }
                 }
@@ -139,6 +142,14 @@ mod tests {
         assert!(!board.apply_move(Position { x: 0, y: 0 }, Position { x: 1, y: 1 }));
         assert!(board.apply_move(Position { x: 0, y: 0 }, Position { x: 1, y: 0 }));
         assert!(!board.apply_move(Position { x: 0, y: 0 }, Position { x: 1, y: 0 }));
+    }
+
+    #[test]
+    fn move_disallows_lower_stack_onto_higher_stack() {
+        let mut board = GameBoard::new_filled(3, 3);
+        assert!(board.apply_move(Position { x: 0, y: 0 }, Position { x: 1, y: 0 }));
+        assert!(!board.apply_move(Position { x: 2, y: 0 }, Position { x: 1, y: 0 }));
+        assert!(board.apply_move(Position { x: 1, y: 0 }, Position { x: 2, y: 0 }));
     }
 
     #[test]

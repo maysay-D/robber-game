@@ -1,8 +1,12 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Mutex, mpsc::{self, Receiver, Sender}};
+use std::thread;
 
 mod game_logic;
-
 use game_logic::{GameBoard, Position};
 
 const CELL_SIZE: f32 = 72.0;
@@ -50,6 +54,45 @@ impl PlayerTurn {
         }
     }
 }
+
+// ----------------------------------------------------------------
+// ネットワーク用のデータ構造
+// ----------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+enum GameMessage {
+    // game_logic::Position側にSerializeが実装されていないことを想定し，
+    // usizeで座標データを送受信
+    Move {
+        from_x: usize,
+        from_y: usize,
+        to_x: usize,
+        to_y: usize,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetworkMode {
+    Offline,
+    Host,
+    Join,
+}
+
+#[derive(Resource)]
+struct SelectedNetworkMode(NetworkMode);
+
+#[derive(Resource)]
+struct LocalPlayer {
+    side: Option<PlayerTurn>, // Noneの場合はオフライン(両方の手を操作可能)
+}
+
+#[derive(Resource)]
+struct NetworkChannels {
+    tx: Mutex<Sender<GameMessage>>,
+    rx: Mutex<Receiver<GameMessage>>,
+}
+
+// ----------------------------------------------------------------
 
 #[derive(Resource)]
 struct Gameplay {
@@ -102,11 +145,12 @@ fn main() {
         )
         .add_systems(OnEnter(AppState::Title), enter_title)
         .add_systems(OnExit(AppState::Title), cleanup_title)
-        .add_systems(OnEnter(AppState::Playing), setup_game)
+        .add_systems(OnEnter(AppState::Playing), (setup_network, setup_game).chain())
         .add_systems(
             Update,
             (
                 handle_play_clicks,
+                handle_network_messages, // ネットワーク受信処理を追加
                 playing_keyboard_shortcuts,
                 update_board_visuals,
                 update_turn_highlight,
@@ -137,6 +181,7 @@ fn cleanup_title(mut commands: Commands, query: Query<Entity, With<TitleEntity>>
 }
 
 fn title_input_system(
+    mut commands: Commands,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut next_state: ResMut<NextState<AppState>>,
     mut settings: ResMut<TitleSettings>,
@@ -159,7 +204,16 @@ fn title_input_system(
             .saturating_sub(1)
             .max(TITLE_MIN_SIZE);
     }
+
+    // キー入力でモードを決定してゲーム開始
     if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
+        commands.insert_resource(SelectedNetworkMode(NetworkMode::Offline));
+        next_state.set(AppState::Playing);
+    } else if keyboard.just_pressed(KeyCode::KeyH) {
+        commands.insert_resource(SelectedNetworkMode(NetworkMode::Host));
+        next_state.set(AppState::Playing);
+    } else if keyboard.just_pressed(KeyCode::KeyJ) {
+        commands.insert_resource(SelectedNetworkMode(NetworkMode::Join));
         next_state.set(AppState::Playing);
     }
 }
@@ -169,11 +223,80 @@ fn update_title_window(
     settings: Res<TitleSettings>,
 ) {
     window.title = format!(
-        "Robber Game | タイトル: 盤面サイズ {}x{} (↑/↓:高さ, ←/→:幅, Enterで開始)",
+        "Robber Game | サイズ {}x{} (矢印:変更 / Enter:オフライン / H:ホスト作成 / J:参加)",
         settings.board_width,
         settings.board_height
     );
 }
+
+// ----------------------------------------------------------------
+// ネットワーク接続のセットアップ
+// ----------------------------------------------------------------
+fn setup_network(mut commands: Commands, mode_res: Res<SelectedNetworkMode>) {
+    match mode_res.0 {
+        NetworkMode::Offline => {
+            commands.insert_resource(LocalPlayer { side: None });
+        }
+        NetworkMode::Host => {
+            println!("ポート8080でクライアントの接続を待機中...");
+            let listener = TcpListener::bind("0.0.0.0:8080").expect("ポートのバインドに失敗しました");
+            let (stream, addr) = listener.accept().expect("接続の受け入れに失敗しました"); // ← mut を削除
+            println!("クライアントが接続しました: {}", addr);
+
+            setup_tcp_threads(&mut commands, stream);
+            commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::First) }); // ホストが先手
+        }
+        NetworkMode::Join => {
+            println!("サーバー(127.0.0.1:8080)に接続中...");
+            // Todo: 試しに実装したものであるため，接続に失敗するとパニックする．UIでエラーを出す処理が必要
+            let stream = TcpStream::connect("127.0.0.1:8080").expect("サーバーへの接続に失敗しました");
+            println!("サーバーに接続しました！");
+
+            setup_tcp_threads(&mut commands, stream);
+            commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::Second) }); // 参加者が後手
+        }
+    }
+}
+
+// TCPの送受信スレッドを立ち上げるヘルパー関数
+fn setup_tcp_threads(commands: &mut Commands, mut stream: TcpStream) {
+    let mut stream_clone = stream.try_clone().unwrap();
+
+    let (bevy_tx, net_rx) = mpsc::channel::<GameMessage>();
+    let (net_tx, bevy_rx) = mpsc::channel::<GameMessage>();
+
+    // 受信スレッド
+    thread::spawn(move || {
+        let mut buffer = [0; 512];
+        loop {
+            if let Ok(size) = stream_clone.read(&mut buffer) {
+                if size == 0 { break; } // 切断検知
+                if let Ok(msg) = bincode::deserialize::<GameMessage>(&buffer[..size]) {
+                    let _ = net_tx.send(msg);
+                }
+            } else {
+                break;
+            }
+        }
+        println!("通信が切断されました．");
+    });
+
+    // 送信スレッド
+    thread::spawn(move || {
+        while let Ok(msg) = net_rx.recv() {
+            if let Ok(data) = bincode::serialize(&msg) {
+                let _ = stream.write_all(&data);
+            }
+        }
+    });
+
+    commands.insert_resource(NetworkChannels {
+        tx: Mutex::new(bevy_tx),
+        rx: Mutex::new(bevy_rx),
+    });
+}
+// ----------------------------------------------------------------
+
 
 fn setup_game(mut commands: Commands, settings: Res<TitleSettings>) {
     let board = GameBoard::new_filled(settings.board_width, settings.board_height);
@@ -247,6 +370,10 @@ fn cleanup_game(
     if gameplay.is_some() {
         commands.remove_resource::<Gameplay>();
     }
+    // ネットワークリソースのお掃除
+    commands.remove_resource::<NetworkChannels>();
+    commands.remove_resource::<LocalPlayer>();
+    commands.remove_resource::<SelectedNetworkMode>();
 }
 
 fn handle_play_clicks(
@@ -254,10 +381,20 @@ fn handle_play_clicks(
     window: Single<&Window, With<PrimaryWindow>>,
     camera_q: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
     mut gameplay: ResMut<Gameplay>,
+    local_player: Res<LocalPlayer>,
+    network_opt: Option<Res<NetworkChannels>>, // オフライン時は存在しない
 ) {
     if !mouse.just_pressed(MouseButton::Left) || gameplay.winner.is_some() {
         return;
     }
+
+    // オンライン対戦中かつ，自分のターンではない場合は入力を弾く
+    if let Some(my_side) = local_player.side {
+        if gameplay.turn != my_side {
+            return;
+        }
+    }
+
     let cursor = match window.cursor_position() {
         Some(cursor) => cursor,
         None => return,
@@ -280,12 +417,28 @@ fn handle_play_clicks(
             gameplay.selected = None;
             return;
         }
+
+        // ローカルで手を適用
         if gameplay.board.apply_move(selected, clicked_cell) {
             let current = gameplay.turn;
             gameplay.turn = gameplay.turn.next();
             gameplay.selected = None;
             if !gameplay.board.has_legal_move() {
                 gameplay.winner = Some(current);
+            }
+
+            // オンラインであれば，適用した手を相手に送信する
+            if let Some(network) = network_opt {
+                let msg = GameMessage::Move {
+                    from_x: selected.x,
+                    from_y: selected.y,
+                    to_x: clicked_cell.x,
+                    to_y: clicked_cell.y,
+                };
+                // Mutexをロックしてから送信する
+                if let Ok(tx) = network.tx.lock() {
+                    let _ = tx.send(msg);
+                }
             }
             return;
         }
@@ -295,6 +448,39 @@ fn handle_play_clicks(
         gameplay.selected = Some(clicked_cell);
     } else {
         gameplay.selected = None;
+    }
+}
+
+// ----------------------------------------------------------------
+// ネットワークからの受信処理
+// ----------------------------------------------------------------
+fn handle_network_messages(
+    mut gameplay: ResMut<Gameplay>,
+    network_opt: Option<Res<NetworkChannels>>,
+) {
+    let Some(network) = network_opt else { return; };
+
+    // Mutexをロックして Receiver にアクセス
+    let Ok(rx) = network.rx.lock() else { return; };
+
+    // キューに溜まっているすべてのメッセージを処理する
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            GameMessage::Move { from_x, from_y, to_x, to_y } => {
+                let from = Position { x: from_x, y: from_y };
+                let to = Position { x: to_x, y: to_y };
+
+                // 受信した手で盤面を更新
+                if gameplay.board.apply_move(from, to) {
+                    let current = gameplay.turn;
+                    gameplay.turn = gameplay.turn.next();
+                    gameplay.selected = None;
+                    if !gameplay.board.has_legal_move() {
+                        gameplay.winner = Some(current);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -353,15 +539,24 @@ fn update_turn_highlight(
 fn update_game_window_title(
     mut window: Single<&mut Window, With<PrimaryWindow>>,
     gameplay: Res<Gameplay>,
+    local_player: Res<LocalPlayer>,
 ) {
+    let mode_str = match local_player.side {
+        Some(PlayerTurn::First) => "[ホスト: あなたは先手]",
+        Some(PlayerTurn::Second) => "[参加者: あなたは後手]",
+        None => "[オフライン]",
+    };
+
     if let Some(winner) = gameplay.winner {
         window.title = format!(
-            "Robber Game | {} の勝ち (Rでタイトルへ戻る)",
+            "Robber Game {} | {} の勝ち (Rでタイトルへ戻る)",
+            mode_str,
             winner.label()
         );
     } else {
         window.title = format!(
-            "Robber Game | {} の手番をハイライト中 (盤面 {}x{})",
+            "Robber Game {} | {} の手番をハイライト中 (盤面 {}x{})",
+            mode_str,
             gameplay.turn.label(),
             gameplay.board.width(),
             gameplay.board.height()

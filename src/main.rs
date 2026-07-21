@@ -10,15 +10,21 @@ mod game_logic;
 use game_logic::{GameBoard, Position};
 
 const CELL_SIZE: f32 = 72.0;
-const TITLE_MIN_SIZE: usize = 2;
+/*
+const TITLE_MIN_SIZE: usize = 1;
 const TITLE_MAX_SIZE: usize = 12;
+*/
 
 #[derive(States, Debug, Hash, Eq, PartialEq, Clone, Default)]
 enum AppState {
     #[default]
     Title,
+    Connecting,
     Playing,
 }
+
+#[derive(Resource)]
+struct ConnectionReceiver(Mutex<Receiver<TcpStream>>);
 
 #[derive(Resource)]
 struct TitleSettings {
@@ -26,7 +32,7 @@ struct TitleSettings {
     board_height: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum PlayerTurn {
     First,
     Second,
@@ -69,6 +75,15 @@ enum GameMessage {
         to_x: usize,
         to_y: usize,
     },
+    Turn {
+        side: PlayerTurn,
+    },
+    StateRequest {
+        board_state: Vec<u8>, // 例: 各セルの石の数を1次元配列にしたもの
+        turn: PlayerTurn,
+        is_done: bool,        // 決着がついたか
+        winner: Option<PlayerTurn>, // 報酬計算用
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,6 +91,7 @@ enum NetworkMode {
     Offline,
     Host,
     Join,
+    PlayAgainstAI,
 }
 
 #[derive(Resource)]
@@ -133,8 +149,8 @@ fn main() {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.08)))
         .insert_resource(TitleSettings {
-            board_width: 5,
-            board_height: 6,
+            board_width: 4,
+            board_height: 1,
         })
         .add_plugins(DefaultPlugins)
         .init_state::<AppState>()
@@ -145,7 +161,16 @@ fn main() {
         )
         .add_systems(OnEnter(AppState::Title), enter_title)
         .add_systems(OnExit(AppState::Title), cleanup_title)
-        .add_systems(OnEnter(AppState::Playing), (setup_network, setup_game).chain())
+        .add_systems(OnEnter(AppState::Connecting), start_network_connection)
+        .add_systems(
+            Update,
+            (
+                check_network_connection,
+                update_connecting_window,      // 追加
+                connecting_keyboard_shortcuts, // 追加
+            ).run_if(in_state(AppState::Connecting))
+        )
+        .add_systems(OnEnter(AppState::Playing), setup_game)
         .add_systems(
             Update,
             (
@@ -160,6 +185,56 @@ fn main() {
         )
         .add_systems(OnExit(AppState::Playing), cleanup_game)
         .run();
+}
+
+fn start_network_connection(
+    mut commands: Commands,
+    mode_res: Res<SelectedNetworkMode>,
+) {
+    let (tx, rx) = mpsc::channel();
+
+    match mode_res.0 {
+        NetworkMode::Host | NetworkMode::PlayAgainstAI => {
+            println!("ポート8080でクライアント（もしくはAI）の接続を待機中...");
+            thread::spawn(move || {
+                // 別スレッドで待機するため、メインループは止まらない
+                if let Ok(listener) = TcpListener::bind("0.0.0.0:8080") {
+                    if let Ok((stream, addr)) = listener.accept() {
+                        println!("クライアントが接続しました: {}", addr);
+                        let _ = tx.send(stream);
+                    }
+                }
+            });
+        }
+        NetworkMode::Join => {
+            println!("サーバー(127.0.0.1:8080)に接続中...");
+            thread::spawn(move || {
+                // 接続が確立するまで別スレッドで試行
+                if let Ok(stream) = TcpStream::connect("127.0.0.1:8080") {
+                    println!("サーバーに接続しました！");
+                    let _ = tx.send(stream);
+                }
+            });
+        }
+        NetworkMode::Offline => unreachable!(),
+    }
+
+    commands.insert_resource(ConnectionReceiver(Mutex::new(rx)));
+}
+
+fn check_network_connection(
+    mut commands: Commands,
+    receiver: Option<Res<ConnectionReceiver>>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    // 別スレッドから TcpStream が送られてきたらゲーム開始
+    if let Some(receiver) = receiver {
+        if let Ok(stream) = receiver.0.lock().unwrap().try_recv() {
+            setup_tcp_threads(&mut commands, stream);
+            commands.remove_resource::<ConnectionReceiver>();
+            next_state.set(AppState::Playing);
+        }
+    }
 }
 
 fn setup_camera(mut commands: Commands) {
@@ -184,8 +259,9 @@ fn title_input_system(
     mut commands: Commands,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut next_state: ResMut<NextState<AppState>>,
-    mut settings: ResMut<TitleSettings>,
+    // mut settings: ResMut<TitleSettings>,
 ) {
+    /*
     if keyboard.just_pressed(KeyCode::ArrowUp) || keyboard.just_pressed(KeyCode::Equal) {
         settings.board_height = (settings.board_height + 1).min(TITLE_MAX_SIZE);
     }
@@ -204,58 +280,33 @@ fn title_input_system(
             .saturating_sub(1)
             .max(TITLE_MIN_SIZE);
     }
+    */
 
     // キー入力でモードを決定してゲーム開始
     if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
         commands.insert_resource(SelectedNetworkMode(NetworkMode::Offline));
+        commands.insert_resource(LocalPlayer { side: None });
         next_state.set(AppState::Playing);
     } else if keyboard.just_pressed(KeyCode::KeyH) {
         commands.insert_resource(SelectedNetworkMode(NetworkMode::Host));
-        next_state.set(AppState::Playing);
+        commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::First) });
+        next_state.set(AppState::Connecting);
     } else if keyboard.just_pressed(KeyCode::KeyJ) {
         commands.insert_resource(SelectedNetworkMode(NetworkMode::Join));
-        next_state.set(AppState::Playing);
+        commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::Second) });
+        next_state.set(AppState::Connecting);
+    } else if keyboard.just_pressed(KeyCode::KeyA) {
+        commands.insert_resource(SelectedNetworkMode(NetworkMode::PlayAgainstAI));
+        commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::First) });
+        next_state.set(AppState::Connecting);
     }
 }
 
 fn update_title_window(
     mut window: Single<&mut Window, With<PrimaryWindow>>,
-    settings: Res<TitleSettings>,
+    // settings: Res<TitleSettings>,
 ) {
-    window.title = format!(
-        "Robber Game | サイズ {}x{} (矢印:変更 / Enter:オフライン / H:ホスト作成 / J:参加)",
-        settings.board_width,
-        settings.board_height
-    );
-}
-
-// ----------------------------------------------------------------
-// ネットワーク接続のセットアップ
-// ----------------------------------------------------------------
-fn setup_network(mut commands: Commands, mode_res: Res<SelectedNetworkMode>) {
-    match mode_res.0 {
-        NetworkMode::Offline => {
-            commands.insert_resource(LocalPlayer { side: None });
-        }
-        NetworkMode::Host => {
-            println!("ポート8080でクライアントの接続を待機中...");
-            let listener = TcpListener::bind("0.0.0.0:8080").expect("ポートのバインドに失敗しました");
-            let (stream, addr) = listener.accept().expect("接続の受け入れに失敗しました"); // ← mut を削除
-            println!("クライアントが接続しました: {}", addr);
-
-            setup_tcp_threads(&mut commands, stream);
-            commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::First) }); // ホストが先手
-        }
-        NetworkMode::Join => {
-            println!("サーバー(127.0.0.1:8080)に接続中...");
-            // Todo: 試しに実装したものであるため，接続に失敗するとパニックする．UIでエラーを出す処理が必要
-            let stream = TcpStream::connect("127.0.0.1:8080").expect("サーバーへの接続に失敗しました");
-            println!("サーバーに接続しました！");
-
-            setup_tcp_threads(&mut commands, stream);
-            commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::Second) }); // 参加者が後手
-        }
-    }
+    window.title = "Robber Game (Enter:オフライン / H:ホスト作成 / J:参加 / A:AI対戦)".to_string();
 }
 
 // TCPの送受信スレッドを立ち上げるヘルパー関数
@@ -267,25 +318,41 @@ fn setup_tcp_threads(commands: &mut Commands, mut stream: TcpStream) {
 
     // 受信スレッド
     thread::spawn(move || {
-        let mut buffer = [0; 512];
         loop {
-            if let Ok(size) = stream_clone.read(&mut buffer) {
-                if size == 0 { break; } // 切断検知
-                if let Ok(msg) = bincode::deserialize::<GameMessage>(&buffer[..size]) {
-                    let _ = net_tx.send(msg);
-                }
-            } else {
+            // データサイズ（4バイト）を正確に読み取る
+            let mut len_buf = [0u8; 4];
+            if stream_clone.read_exact(&mut len_buf).is_err() {
+                break; // 切断検知
+            }
+            let msg_len = u32::from_le_bytes(len_buf) as usize;
+
+            // 指定されたサイズ分の実データを正確に読み取る
+            let mut msg_buf = vec![0; msg_len];
+            if stream_clone.read_exact(&mut msg_buf).is_err() {
                 break;
             }
+
+            // 完璧に揃ったデータだけをJSONとしてデシリアライズ
+            if let Ok(msg) = serde_json::from_slice::<GameMessage>(&msg_buf) {
+                let _ = net_tx.send(msg);
+            } else {
+                println!("JSONデコードエラー: 受信したデータを解析できませんでした");
+            }
         }
-        println!("通信が切断されました．");
+        println!("通信が切断されました。");
     });
 
     // 送信スレッド
     thread::spawn(move || {
         while let Ok(msg) = net_rx.recv() {
-            if let Ok(data) = bincode::serialize(&msg) {
-                let _ = stream.write_all(&data);
+            // メッセージをJSONのバイト配列にシリアライズ
+            if let Ok(data) = serde_json::to_vec(&msg) {
+                // データサイズを4バイトの配列に変換
+                let len_bytes = (data.len() as u32).to_le_bytes();
+
+                // サイズ -> 実データの順で送信
+                if stream.write_all(&len_bytes).is_err() { break; }
+                if stream.write_all(&data).is_err() { break; }
             }
         }
     });
@@ -383,6 +450,7 @@ fn handle_play_clicks(
     mut gameplay: ResMut<Gameplay>,
     local_player: Res<LocalPlayer>,
     network_opt: Option<Res<NetworkChannels>>, // オフライン時は存在しない
+    mode: Res<SelectedNetworkMode>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) || gameplay.winner.is_some() {
         return;
@@ -423,6 +491,7 @@ fn handle_play_clicks(
             let current = gameplay.turn;
             gameplay.turn = gameplay.turn.next();
             gameplay.selected = None;
+            let is_done = !gameplay.board.has_legal_move();
             if !gameplay.board.has_legal_move() {
                 gameplay.winner = Some(current);
             }
@@ -435,9 +504,34 @@ fn handle_play_clicks(
                     to_x: clicked_cell.x,
                     to_y: clicked_cell.y,
                 };
+                let msg_turn = match local_player.side {
+                    Some(side) => GameMessage::Turn { side },
+                    None => GameMessage::Turn { side: current.next() }, // オフライン時は次の手番を送信
+                };
                 // Mutexをロックしてから送信する
                 if let Ok(tx) = network.tx.lock() {
                     let _ = tx.send(msg);
+                    let _ = tx.send(msg_turn);
+
+                    if mode.0 == NetworkMode::PlayAgainstAI {
+                        // TODO: gameplay.boardの中身をフラットな配列に変換する
+                        // 例: 盤面サイズが4x3なら、12個の要素を持つVec<u8>を作る
+                        let mut board_state = Vec::new();
+                        for y in 0..gameplay.board.height() {
+                            for x in 0..gameplay.board.width() {
+                                let val = gameplay.board.stack_at(Position{x, y});
+                                board_state.push(val as u8);
+                            }
+                        }
+
+                        let msg_state = GameMessage::StateRequest {
+                            board_state,
+                            turn: gameplay.turn,
+                            is_done,
+                            winner: gameplay.winner,
+                        };
+                        let _ = tx.send(msg_state);
+                    }
                 }
             }
             return;
@@ -457,6 +551,7 @@ fn handle_play_clicks(
 fn handle_network_messages(
     mut gameplay: ResMut<Gameplay>,
     network_opt: Option<Res<NetworkChannels>>,
+    // mode: Res<SelectedNetworkMode>,
 ) {
     let Some(network) = network_opt else { return; };
 
@@ -477,6 +572,28 @@ fn handle_network_messages(
                     gameplay.selected = None;
                     if !gameplay.board.has_legal_move() {
                         gameplay.winner = Some(current);
+                    }
+                }
+            }
+            GameMessage::Turn { side } => {
+                // 受信した手番情報でターンを更新
+                gameplay.turn = side.next();
+            }
+            GameMessage::StateRequest { board_state, turn, is_done, winner } => {
+                // AIからの盤面状態を受信して更新
+                let width = gameplay.board.width();
+                let height = gameplay.board.height();
+                if board_state.len() == width * height {
+                    for y in 0..height {
+                        for x in 0..width {
+                            let pos = Position { x, y };
+                            let val = board_state[y * width + x] as usize;
+                            gameplay.board.set_stack_at(pos, val);
+                        }
+                    }
+                    gameplay.turn = turn;
+                    if is_done {
+                        gameplay.winner = winner;
                     }
                 }
             }
@@ -526,6 +643,34 @@ fn update_board_visuals(
         } else {
             height.to_string()
         };
+    }
+}
+
+// 接続待機中のウィンドウタイトル更新
+fn update_connecting_window(
+    mut window: Single<&mut Window, With<PrimaryWindow>>,
+    mode: Res<SelectedNetworkMode>,
+) {
+    match mode.0 {
+        NetworkMode::Host => window.title = "クライアントの接続を待機中... (Escでキャンセル)".to_string(),
+        NetworkMode::Join => window.title = "サーバーに接続中... (Escでキャンセル)".to_string(),
+        NetworkMode::PlayAgainstAI => window.title = "AIの接続を待機中... (Escでキャンセル)".to_string(),
+        _ => {}
+    }
+}
+
+// 接続待機中のキャンセル処理
+fn connecting_keyboard_shortcuts(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut commands: Commands,
+) {
+    if keyboard.just_pressed(KeyCode::Escape) {
+        // リソースをお掃除してタイトルに戻る
+        commands.remove_resource::<ConnectionReceiver>();
+        commands.remove_resource::<SelectedNetworkMode>();
+        commands.remove_resource::<LocalPlayer>();
+        next_state.set(AppState::Title);
     }
 }
 

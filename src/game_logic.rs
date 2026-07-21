@@ -12,9 +12,16 @@ pub struct GameBoard {
 }
 
 impl GameBoard {
+    pub(crate) fn set_stack_at(&mut self, p0: Position, p1: usize) {
+        let idx = self.index(p0);
+        self.cells[idx] = p1 as u32;
+    }
+}
+
+impl GameBoard {
     pub fn new_filled(width: usize, height: usize) -> Self {
-        let clamped_width = width.max(2);
-        let clamped_height = height.max(2);
+        let clamped_width = width.max(1);
+        let clamped_height = height.max(1);
         Self {
             width: clamped_width,
             height: clamped_height,

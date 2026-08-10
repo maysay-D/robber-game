@@ -229,7 +229,7 @@ fn enter_title(mut commands: Commands, asset_server: Res<AssetServer>) {
     ));
 
     commands.spawn((
-        Text2d::new("ロバーゲーム"),
+        Text2d::new("Stomper"),
         TextFont {
             font: japanese_font(&asset_server),
             font_size: FontSize::Px(64.0),

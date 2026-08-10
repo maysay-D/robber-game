@@ -80,6 +80,24 @@ impl GameBoard {
         false
     }
 
+    pub fn legal_moves(&self) -> Vec<(Position, Position)> {
+        let mut moves = Vec::new();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let from = Position { x, y };
+                if self.stack_at(from) == 0 {
+                    continue;
+                }
+                for to in self.neighbors(from) {
+                    if self.can_move(from, to) {
+                        moves.push((from, to));
+                    }
+                }
+            }
+        }
+        moves
+    }
+
     fn index(&self, pos: Position) -> usize {
         pos.y * self.width + pos.x
     }

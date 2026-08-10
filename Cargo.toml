@@ -1,7 +1,8 @@
 [package]
-name = "robber-game"
+name = "stomper-game"
 version = "0.1.0"
 edition = "2024"
+default-run = "stomper-game"
 
 [dependencies]
 bevy = { version = "0.19.0", default-features = false, features = [
@@ -12,5 +13,27 @@ bevy = { version = "0.19.0", default-features = false, features = [
     "default_font",
     "png",
 ] }
+bevy_anti_alias = { version = "0.18.0-rc.2" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
+rand = "0.8"
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = 'z'     # Optimize for size
+lto = true          # Enable Link-Time Optimization
+codegen-units = 1   # Reduce parallel code generation blocks to maximize binary size savings
+panic = 'abort'     # Remove stack unwinding text overhead
+
+# Strip debug symbols from the web build specifically
+[profile.wasm-release]
+inherits = "release"
+strip = "symbols"
+
+[[bin]]
+name = "stomper-game"
+path = "src/main.rs"
+
+[[bin]]
+name = "stomper-server"
+path = "src/server.rs"

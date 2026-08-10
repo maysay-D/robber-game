@@ -1,5 +1,8 @@
 import copy
 import random
+import re
+import argparse
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -8,16 +11,13 @@ import torch.optim as optim
 
 from rl_agent import RLAgent
 
-# ==========================================
-# ★ここで学習させたい盤面サイズを指定します
-# Rustの main.rs の TitleSettings と合わせてください
-BOARD_WIDTH = 4
-BOARD_HEIGHT = 1
-# ==========================================
+CHECKPOINT_RE = re.compile(
+    r"^(?P<agent_name>.+)_(?P<width>\d+)x(?P<height>\d+)_(?P<episodes>\d+)\.pkl$"
+)
 
 
 class MockRobberGameEnv:
-    def __init__(self, width=BOARD_WIDTH, height=BOARD_HEIGHT):
+    def __init__(self, width, height):
         self.width = max(width, 1)
         self.height = max(height, 1)
         self.total_cells = self.width * self.height
@@ -122,9 +122,8 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-def count_legal_moves(board, width=BOARD_WIDTH, height=BOARD_HEIGHT):
+def count_legal_moves(board, width, height):
     count = 0
-    total_cells = width * height
 
     for from_y in range(height):
         for from_x in range(width):
@@ -154,25 +153,156 @@ def count_legal_moves(board, width=BOARD_WIDTH, height=BOARD_HEIGHT):
     return count
 
 
-def compute_reward(board_before, board_after, current_player, winner, done):
+def compute_reward(board_before, board_after, current_player, winner, done, width, height):
     if done:
         return 1.0 if winner == current_player else -1.0
 
-    before_moves = count_legal_moves(board_before)
-    after_moves = count_legal_moves(board_after)
+    before_moves = count_legal_moves(board_before, width, height)
+    after_moves = count_legal_moves(board_after, width, height)
 
     # 局面を縮める方向へ少しだけ報酬を与える
     mobility_delta = before_moves - after_moves
     return 0.02 * mobility_delta
 
 
+def find_latest_checkpoint(base_dir, agent_name, width, height):
+    candidates = []
+    pattern = f"{agent_name}_{width}x{height}_*.pkl"
+    for path in base_dir.glob(pattern):
+        match = CHECKPOINT_RE.match(path.name)
+        if not match:
+            continue
+        candidates.append((int(match.group("episodes")), path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
+def load_checkpoint(path, width, height):
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    agent = RLAgent(width, height)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        agent.load_state_dict(checkpoint["model_state_dict"])
+        metadata = checkpoint
+    else:
+        agent.load_state_dict(checkpoint)
+        metadata = {}
+    agent.eval()
+    return agent, metadata
+
+
+def save_checkpoint(
+    path,
+    agent,
+    agent_name,
+    width,
+    height,
+    episodes,
+    policy_table=None,
+    is_perfect_agent=False,
+):
+    torch.save(
+        {
+            "model_state_dict": agent.state_dict(),
+            "board_width": width,
+            "board_height": height,
+            "agent_name": agent_name,
+            "episodes": episodes,
+            "policy_table": policy_table,
+            "is_perfect_agent": is_perfect_agent,
+        },
+        path,
+    )
+
+
+def build_policy_table(agent, width, height):
+    board_state = [1] * (width * height)
+    state_tensor = torch.tensor(board_state, dtype=torch.float32)
+    valid_mask = agent.get_valid_mask(board_state)
+
+    with torch.no_grad():
+        q_values = agent(state_tensor)
+        if q_values.dim() > 1:
+            q_values = q_values.squeeze(0)
+
+    masked_q = q_values.clone()
+    masked_q[~valid_mask] = -float("inf")
+    probabilities = torch.softmax(masked_q[valid_mask], dim=0)
+
+    full_probabilities = [0.0] * (width * height * width * height)
+    valid_indices = valid_mask.nonzero(as_tuple=True)[0].tolist()
+    for index, probability in zip(valid_indices, probabilities.tolist()):
+        full_probabilities[index] = probability
+
+    best_action_idx = int(masked_q.argmax().item())
+    best_probability = full_probabilities[best_action_idx]
+    return {
+        "board_state": board_state,
+        "probabilities": full_probabilities,
+        "best_action_idx": best_action_idx,
+        "best_probability": best_probability,
+    }
+
+
+def checkpoint_is_perfect(checkpoint, threshold=0.999999):
+    policy_table = checkpoint.get("policy_table")
+    if not isinstance(policy_table, dict):
+        return False
+    best_probability = float(policy_table.get("best_probability", 0.0))
+    return best_probability >= threshold
+
+
+def persist_policy_table(path, checkpoint, policy_table):
+    checkpoint = dict(checkpoint)
+    checkpoint["policy_table"] = policy_table
+    checkpoint["is_perfect_agent"] = checkpoint_is_perfect(checkpoint)
+    torch.save(checkpoint, path)
+
+
+def ensure_policy_table(path, agent, width, height, checkpoint):
+    updated = dict(checkpoint)
+    needs_save = False
+    if not isinstance(updated.get("policy_table"), dict):
+        updated["policy_table"] = build_policy_table(agent, width, height)
+        needs_save = True
+    updated["is_perfect_agent"] = checkpoint_is_perfect(updated)
+    if updated.get("is_perfect_agent") != checkpoint.get("is_perfect_agent") or needs_save:
+        torch.save(updated, path)
+    return updated
+
+
 def train():
+    parser = argparse.ArgumentParser(description="Train a robber-game RL agent")
+    parser.add_argument("--agent_name", type=str, default="AlphaStomper")
+    parser.add_argument("--width", type=int, required=True)
+    parser.add_argument("--height", type=int, required=True)
+    parser.add_argument("--episodes", type=int, required=True, help="additional training episodes")
+    args = parser.parse_args()
+
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
 
-    env = MockRobberGameEnv(BOARD_WIDTH, BOARD_HEIGHT)
-    agent = RLAgent(BOARD_WIDTH, BOARD_HEIGHT)
+    width = max(args.width, 1)
+    height = max(args.height, 1)
+    env = MockRobberGameEnv(width, height)
+
+    base_dir = Path(__file__).resolve().parent
+    latest_checkpoint = find_latest_checkpoint(base_dir, args.agent_name, width, height)
+    start_episodes = 0
+    agent = RLAgent(width, height)
+    if latest_checkpoint is not None:
+        print(f"既存モデル {latest_checkpoint.name} を読み込みます...")
+        agent, metadata = load_checkpoint(latest_checkpoint, width, height)
+        metadata = ensure_policy_table(latest_checkpoint, agent, width, height, metadata)
+        start_episodes = int(metadata.get("episodes", 0))
+        if metadata.get("is_perfect_agent", False):
+            print("このモデルは完全解析済みのため、追加学習を終了します。")
+            return
+    else:
+        print("新規学習を開始します。")
+
     optimizer = optim.Adam(agent.parameters(), lr=1e-3)
 
     target_network = copy.deepcopy(agent.network)
@@ -183,14 +313,14 @@ def train():
     memory = ReplayBuffer(capacity=20000)
 
     batch_size = 128
-    episodes = 6000
+    episodes = args.episodes
     gamma = 0.95
 
     epsilon_start = 0.35
     epsilon_end = 0.05
     target_update_interval = 200
 
-    print(f"盤面サイズ {BOARD_WIDTH}x{BOARD_HEIGHT} での自己対局を開始します...")
+    print(f"盤面サイズ {width}x{height} で {episodes} エピソードの追加学習を開始します...")
 
     train_steps = 0
     for episode in range(episodes):
@@ -201,7 +331,7 @@ def train():
             epsilon_start - (episode / max(1, episodes - 1)) * (epsilon_start - epsilon_end),
             )
 
-        max_steps = BOARD_WIDTH * BOARD_HEIGHT * 4
+        max_steps = width * height * 4
         for _ in range(max_steps):
             action_info = agent.select_action(state, epsilon=epsilon)
             if action_info is None:
@@ -210,11 +340,10 @@ def train():
             action_idx = action_info["action_idx"]
             next_state, winner, done = env.step(action_idx)
 
-            reward = compute_reward(state, next_state, current_player, winner, done)
+            reward = compute_reward(state, next_state, current_player, winner, done, width, height)
 
             # 同一エージェントに対して、自分視点・相手視点の両方から学ぶ
             memory.push(state, action_idx, reward, next_state, done)
-            memory.push(state, action_idx, -reward, next_state, done)
 
             state = next_state
             current_player = env.current_player
@@ -250,7 +379,7 @@ def train():
                     best_action_idx = int(next_q_online_i.argmax().item())
                     target_q_values[i, 0] = next_q_target[i, best_action_idx]
 
-                target_q = rewards + gamma * (1.0 - dones) * target_q_values
+                target_q = rewards - gamma * (1.0 - dones) * target_q_values
 
             loss = F.smooth_l1_loss(current_q, target_q)
             loss = (sample_weights * loss).mean()
@@ -267,9 +396,21 @@ def train():
         if (episode + 1) % 100 == 0:
             print(f"Episode {episode + 1}/{episodes} 完了 | epsilon={epsilon:.3f}")
 
-    weight_name = f"weights_{BOARD_WIDTH}x{BOARD_HEIGHT}.pth"
-    torch.save(agent.state_dict(), weight_name)
-    print(f"学習が完了し、モデル '{weight_name}' を保存しました！")
+    total_episodes = start_episodes + episodes
+    save_path = base_dir / f"{args.agent_name}_{width}x{height}_{total_episodes}.pkl"
+    policy_table = build_policy_table(agent, width, height)
+    is_perfect_agent = checkpoint_is_perfect({"policy_table": policy_table})
+    save_checkpoint(
+        save_path,
+        agent,
+        args.agent_name,
+        width,
+        height,
+        total_episodes,
+        policy_table=policy_table,
+        is_perfect_agent=is_perfect_agent,
+    )
+    print(f"モデルを保存しました: {save_path}")
 
 
 if __name__ == "__main__":

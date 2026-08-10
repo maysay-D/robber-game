@@ -1,25 +1,31 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use serde::{Deserialize, Serialize};
+use rand::{seq::SliceRandom, thread_rng};
+use std::cmp::Reverse;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Mutex, mpsc::{self, Receiver, Sender}};
+use std::net::{Shutdown, TcpStream};
+use std::path::PathBuf;
+use std::sync::{
+    mpsc::{self, Receiver, Sender},
+    Mutex,
+};
+use std::process::{Command, Stdio};
 use std::thread;
 
 mod game_logic;
+mod protocol;
+
 use game_logic::{GameBoard, Position};
+use protocol::{CpuDifficulty, GameMessage, PlayerTurn};
 
 const CELL_SIZE: f32 = 72.0;
-/*
-const TITLE_MIN_SIZE: usize = 1;
-const TITLE_MAX_SIZE: usize = 12;
-*/
 
 #[derive(States, Debug, Hash, Eq, PartialEq, Clone, Default)]
 enum AppState {
     #[default]
     Title,
     Connecting,
+    WaitingForMatch,
     Playing,
 }
 
@@ -32,81 +38,40 @@ struct TitleSettings {
     board_height: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum PlayerTurn {
-    First,
-    Second,
-}
-
-impl PlayerTurn {
-    fn next(self) -> Self {
-        match self {
-            Self::First => Self::Second,
-            Self::Second => Self::First,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::First => "先手",
-            Self::Second => "後手",
-        }
-    }
-
-    fn tint(self) -> Color {
-        match self {
-            Self::First => Color::srgba(0.2, 0.5, 1.0, 0.14),
-            Self::Second => Color::srgba(1.0, 0.45, 0.2, 0.14),
-        }
-    }
-}
-
-// ----------------------------------------------------------------
-// ネットワーク用のデータ構造
-// ----------------------------------------------------------------
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-enum GameMessage {
-    // game_logic::Position側にSerializeが実装されていないことを想定し，
-    // usizeで座標データを送受信
-    Move {
-        from_x: usize,
-        from_y: usize,
-        to_x: usize,
-        to_y: usize,
-    },
-    Turn {
-        side: PlayerTurn,
-    },
-    StateRequest {
-        board_state: Vec<u8>, // 例: 各セルの石の数を1次元配列にしたもの
-        turn: PlayerTurn,
-        is_done: bool,        // 決着がついたか
-        winner: Option<PlayerTurn>, // 報酬計算用
-    },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NetworkMode {
-    Offline,
-    Host,
-    Join,
-    PlayAgainstAI,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GameMode {
+    Cpu(CpuDifficulty),
+    OnlinePlayer,
 }
 
 #[derive(Resource)]
-struct SelectedNetworkMode(NetworkMode);
+struct SelectedGameMode(GameMode);
+
+#[derive(Resource)]
+struct TitleMenuSelection(usize);
 
 #[derive(Resource)]
 struct LocalPlayer {
-    side: Option<PlayerTurn>, // Noneの場合はオフライン(両方の手を操作可能)
+    side: Option<PlayerTurn>,
 }
 
 #[derive(Resource)]
 struct NetworkChannels {
     tx: Mutex<Sender<GameMessage>>,
     rx: Mutex<Receiver<GameMessage>>,
+    stream: Mutex<TcpStream>,
 }
+
+#[derive(Resource)]
+struct TurnTimer {
+    remaining_time: f32,
+}
+
+#[derive(Component)]
+struct TimerText;
+
+#[derive(Component)]
+struct PlayerInfoText;
 
 // ----------------------------------------------------------------
 
@@ -152,12 +117,18 @@ fn main() {
             board_width: 4,
             board_height: 1,
         })
+        .insert_resource(TitleMenuSelection(0))
         .add_plugins(DefaultPlugins)
         .init_state::<AppState>()
         .add_systems(Startup, setup_camera)
         .add_systems(
             Update,
-            (title_input_system, update_title_window).run_if(in_state(AppState::Title)),
+            (
+                title_input_system,
+                update_title_menu_visuals,
+                update_title_window,
+            )
+                .run_if(in_state(AppState::Title)),
         )
         .add_systems(OnEnter(AppState::Title), enter_title)
         .add_systems(OnExit(AppState::Title), cleanup_title)
@@ -166,20 +137,32 @@ fn main() {
             Update,
             (
                 check_network_connection,
-                update_connecting_window,      // 追加
-                connecting_keyboard_shortcuts, // 追加
+                update_connecting_window,
+                connecting_keyboard_shortcuts,
             ).run_if(in_state(AppState::Connecting))
+        )
+        .add_systems(
+            Update,
+            (
+                wait_for_opponent,
+                update_waiting_window,
+                waiting_keyboard_shortcuts,
+            ).run_if(in_state(AppState::WaitingForMatch))
         )
         .add_systems(OnEnter(AppState::Playing), setup_game)
         .add_systems(
             Update,
             (
                 handle_play_clicks,
-                handle_network_messages, // ネットワーク受信処理を追加
+                handle_network_messages,
+                cpu_take_turn,
+                rematch_prompt_keyboard_shortcuts,
+                sync_rematch_prompt,
                 playing_keyboard_shortcuts,
                 update_board_visuals,
                 update_turn_highlight,
                 update_game_window_title,
+                update_turn_timer,
             )
                 .run_if(in_state(AppState::Playing)),
         )
@@ -187,39 +170,33 @@ fn main() {
         .run();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn start_network_connection(
     mut commands: Commands,
-    mode_res: Res<SelectedNetworkMode>,
+    mode_res: Res<SelectedGameMode>,
 ) {
     let (tx, rx) = mpsc::channel();
 
     match mode_res.0 {
-        NetworkMode::Host | NetworkMode::PlayAgainstAI => {
-            println!("ポート8080でクライアント（もしくはAI）の接続を待機中...");
-            thread::spawn(move || {
-                // 別スレッドで待機するため、メインループは止まらない
-                if let Ok(listener) = TcpListener::bind("0.0.0.0:8080") {
-                    if let Ok((stream, addr)) = listener.accept() {
-                        println!("クライアントが接続しました: {}", addr);
-                        let _ = tx.send(stream);
-                    }
-                }
-            });
-        }
-        NetworkMode::Join => {
+        GameMode::OnlinePlayer => {
             println!("サーバー(127.0.0.1:8080)に接続中...");
             thread::spawn(move || {
-                // 接続が確立するまで別スレッドで試行
                 if let Ok(stream) = TcpStream::connect("127.0.0.1:8080") {
                     println!("サーバーに接続しました！");
                     let _ = tx.send(stream);
                 }
             });
         }
-        NetworkMode::Offline => unreachable!(),
+        GameMode::Cpu(_) => unreachable!(),
     }
 
     commands.insert_resource(ConnectionReceiver(Mutex::new(rx)));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn start_network_connection(mut next_state: ResMut<NextState<AppState>>) {
+    println!("WASM build does not support native TCP multiplayer.");
+    next_state.set(AppState::Title);
 }
 
 fn check_network_connection(
@@ -227,12 +204,11 @@ fn check_network_connection(
     receiver: Option<Res<ConnectionReceiver>>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
-    // 別スレッドから TcpStream が送られてきたらゲーム開始
     if let Some(receiver) = receiver {
         if let Ok(stream) = receiver.0.lock().unwrap().try_recv() {
             setup_tcp_threads(&mut commands, stream);
             commands.remove_resource::<ConnectionReceiver>();
-            next_state.set(AppState::Playing);
+            next_state.set(AppState::WaitingForMatch);
         }
     }
 }
@@ -241,10 +217,65 @@ fn setup_camera(mut commands: Commands) {
     commands.spawn((Camera2d, MainCamera));
 }
 
-fn enter_title(mut commands: Commands) {
+fn japanese_font(asset_server: &AssetServer) -> FontSource {
+    FontSource::Handle(asset_server.load("fonts/NotoSansJP-Variable.ttf"))
+}
+
+fn enter_title(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.spawn((
         Sprite::from_color(Color::srgb(0.12, 0.12, 0.2), Vec2::new(5000.0, 5000.0)),
         Transform::from_xyz(0.0, 0.0, -50.0),
+        TitleEntity,
+    ));
+
+    commands.spawn((
+        Text2d::new("ロバーゲーム"),
+        TextFont {
+            font: japanese_font(&asset_server),
+            font_size: FontSize::Px(64.0),
+            ..default()
+        },
+        TextColor(Color::WHITE),
+        Transform::from_xyz(0.0, 180.0, 10.0),
+        TitleEntity,
+    ));
+
+    commands.spawn((
+        Text2d::new("1/2/3/4 または ↑↓ で選択し、Enter で決定"),
+        TextFont {
+            font: japanese_font(&asset_server),
+            font_size: FontSize::Px(26.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.85, 0.85, 0.85)),
+        Transform::from_xyz(0.0, 125.0, 10.0),
+        TitleEntity,
+    ));
+
+    for (index, label) in title_menu_labels().into_iter().enumerate() {
+        commands.spawn((
+            Text2d::new(label),
+            TextFont {
+                font: japanese_font(&asset_server),
+                font_size: FontSize::Px(34.0),
+                ..default()
+            },
+            TextColor(Color::WHITE),
+            Transform::from_xyz(0.0, 40.0 - index as f32 * 45.0, 10.0),
+            TitleMenuOption { index },
+            TitleEntity,
+        ));
+    }
+
+    commands.spawn((
+        Text2d::new("CPU戦は先手から開始 / 対人戦はサーバーに接続"),
+        TextFont {
+            font: japanese_font(&asset_server),
+            font_size: FontSize::Px(22.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.8, 0.8, 0.8)),
+        Transform::from_xyz(0.0, -160.0, 10.0),
         TitleEntity,
     ));
 }
@@ -258,81 +289,85 @@ fn cleanup_title(mut commands: Commands, query: Query<Entity, With<TitleEntity>>
 fn title_input_system(
     mut commands: Commands,
     keyboard: Res<ButtonInput<KeyCode>>,
+    mut selection: ResMut<TitleMenuSelection>,
     mut next_state: ResMut<NextState<AppState>>,
-    // mut settings: ResMut<TitleSettings>,
 ) {
-    /*
-    if keyboard.just_pressed(KeyCode::ArrowUp) || keyboard.just_pressed(KeyCode::Equal) {
-        settings.board_height = (settings.board_height + 1).min(TITLE_MAX_SIZE);
+    if keyboard.just_pressed(KeyCode::ArrowUp) || keyboard.just_pressed(KeyCode::KeyW) {
+        selection.0 = (selection.0 + title_menu_labels().len() - 1) % title_menu_labels().len();
     }
-    if keyboard.just_pressed(KeyCode::ArrowDown) || keyboard.just_pressed(KeyCode::Minus) {
-        settings.board_height = settings
-            .board_height
-            .saturating_sub(1)
-            .max(TITLE_MIN_SIZE);
+    if keyboard.just_pressed(KeyCode::ArrowDown) || keyboard.just_pressed(KeyCode::KeyS) {
+        selection.0 = (selection.0 + 1) % title_menu_labels().len();
     }
-    if keyboard.just_pressed(KeyCode::ArrowRight) {
-        settings.board_width = (settings.board_width + 1).min(TITLE_MAX_SIZE);
-    }
-    if keyboard.just_pressed(KeyCode::ArrowLeft) {
-        settings.board_width = settings
-            .board_width
-            .saturating_sub(1)
-            .max(TITLE_MIN_SIZE);
-    }
-    */
 
-    // キー入力でモードを決定してゲーム開始
+    for (index, key) in [
+        (0, KeyCode::Digit1),
+        (1, KeyCode::Digit2),
+        (2, KeyCode::Digit3),
+        (3, KeyCode::Digit4),
+    ] {
+        if keyboard.just_pressed(key) {
+            selection.0 = index;
+        }
+    }
+
     if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::Space) {
-        commands.insert_resource(SelectedNetworkMode(NetworkMode::Offline));
-        commands.insert_resource(LocalPlayer { side: None });
-        next_state.set(AppState::Playing);
-    } else if keyboard.just_pressed(KeyCode::KeyH) {
-        commands.insert_resource(SelectedNetworkMode(NetworkMode::Host));
-        commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::First) });
-        next_state.set(AppState::Connecting);
-    } else if keyboard.just_pressed(KeyCode::KeyJ) {
-        commands.insert_resource(SelectedNetworkMode(NetworkMode::Join));
-        commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::Second) });
-        next_state.set(AppState::Connecting);
-    } else if keyboard.just_pressed(KeyCode::KeyA) {
-        commands.insert_resource(SelectedNetworkMode(NetworkMode::PlayAgainstAI));
-        commands.insert_resource(LocalPlayer { side: Some(PlayerTurn::First) });
-        next_state.set(AppState::Connecting);
+        match selection.0 {
+            0 => {
+                commands.insert_resource(SelectedGameMode(GameMode::Cpu(CpuDifficulty::Weak)));
+                commands.insert_resource(LocalPlayer {
+                    side: Some(PlayerTurn::First),
+                });
+                next_state.set(AppState::Playing);
+            }
+            1 => {
+                commands.insert_resource(SelectedGameMode(GameMode::Cpu(CpuDifficulty::Medium)));
+                commands.insert_resource(LocalPlayer {
+                    side: Some(PlayerTurn::First),
+                });
+                next_state.set(AppState::Playing);
+            }
+            2 => {
+                commands.insert_resource(SelectedGameMode(GameMode::Cpu(CpuDifficulty::Strong)));
+                commands.insert_resource(LocalPlayer {
+                    side: Some(PlayerTurn::First),
+                });
+                next_state.set(AppState::Playing);
+            }
+            3 => {
+                commands.insert_resource(SelectedGameMode(GameMode::OnlinePlayer));
+                commands.insert_resource(LocalPlayer { side: None });
+                next_state.set(AppState::Connecting);
+            }
+            _ => {}
+        }
     }
 }
 
-fn update_title_window(
-    mut window: Single<&mut Window, With<PrimaryWindow>>,
-    // settings: Res<TitleSettings>,
-) {
-    window.title = "Robber Game (Enter:オフライン / H:ホスト作成 / J:参加 / A:AI対戦)".to_string();
+fn update_title_window(mut window: Single<&mut Window, With<PrimaryWindow>>) {
+    window.title = "Stomper (1/2/3:CPU 4:Player vs Player)".to_string();
 }
 
-// TCPの送受信スレッドを立ち上げるヘルパー関数
-fn setup_tcp_threads(commands: &mut Commands, mut stream: TcpStream) {
-    let mut stream_clone = stream.try_clone().unwrap();
+fn setup_tcp_threads(commands: &mut Commands, stream: TcpStream) {
+    let reader_stream = stream.try_clone().unwrap();
+    let writer_stream = stream.try_clone().unwrap();
 
     let (bevy_tx, net_rx) = mpsc::channel::<GameMessage>();
     let (net_tx, bevy_rx) = mpsc::channel::<GameMessage>();
 
-    // 受信スレッド
     thread::spawn(move || {
+        let mut stream_clone = reader_stream;
         loop {
-            // データサイズ（4バイト）を正確に読み取る
             let mut len_buf = [0u8; 4];
             if stream_clone.read_exact(&mut len_buf).is_err() {
-                break; // 切断検知
+                break;
             }
             let msg_len = u32::from_le_bytes(len_buf) as usize;
 
-            // 指定されたサイズ分の実データを正確に読み取る
             let mut msg_buf = vec![0; msg_len];
             if stream_clone.read_exact(&mut msg_buf).is_err() {
                 break;
             }
 
-            // 完璧に揃ったデータだけをJSONとしてデシリアライズ
             if let Ok(msg) = serde_json::from_slice::<GameMessage>(&msg_buf) {
                 let _ = net_tx.send(msg);
             } else {
@@ -342,17 +377,15 @@ fn setup_tcp_threads(commands: &mut Commands, mut stream: TcpStream) {
         println!("通信が切断されました。");
     });
 
-    // 送信スレッド
     thread::spawn(move || {
+        let mut stream = writer_stream;
         while let Ok(msg) = net_rx.recv() {
-            // メッセージをJSONのバイト配列にシリアライズ
             if let Ok(data) = serde_json::to_vec(&msg) {
-                // データサイズを4バイトの配列に変換
                 let len_bytes = (data.len() as u32).to_le_bytes();
 
-                // サイズ -> 実データの順で送信
                 if stream.write_all(&len_bytes).is_err() { break; }
                 if stream.write_all(&data).is_err() { break; }
+                let _ = stream.flush();
             }
         }
     });
@@ -360,22 +393,61 @@ fn setup_tcp_threads(commands: &mut Commands, mut stream: TcpStream) {
     commands.insert_resource(NetworkChannels {
         tx: Mutex::new(bevy_tx),
         rx: Mutex::new(bevy_rx),
+        stream: Mutex::new(stream),
     });
 }
-// ----------------------------------------------------------------
 
+#[derive(Component)]
+struct TitleMenuOption {
+    index: usize,
+}
 
-fn setup_game(mut commands: Commands, settings: Res<TitleSettings>) {
+#[derive(Component)]
+struct RematchPrompt;
+
+fn title_menu_labels() -> [&'static str; 4] {
+    [
+        "弱いCPU",
+        "中程度のCPU",
+        "強いCPU",
+        "プレイヤーと対戦",
+    ]
+}
+
+fn update_title_menu_visuals(
+    selection: Res<TitleMenuSelection>,
+    mut query: Query<(&TitleMenuOption, &mut TextColor)>,
+) {
+    for (option, mut color) in &mut query {
+        *color = if option.index == selection.0 {
+            TextColor(Color::srgb(1.0, 0.92, 0.3))
+        } else {
+            TextColor(Color::WHITE)
+        };
+    }
+}
+
+fn setup_game(
+    mut commands: Commands,
+    settings: Res<TitleSettings>,
+    local_player: Res<LocalPlayer>,
+    mode: Res<SelectedGameMode>,
+    asset_server: Res<AssetServer>,
+) {
     let board = GameBoard::new_filled(settings.board_width, settings.board_height);
     let board_width = board.width();
     let board_height = board.height();
     let board_pixel_width = board_extent(board_width);
     let board_pixel_height = board_extent(board_height);
+
     commands.insert_resource(Gameplay {
         board,
         turn: PlayerTurn::First,
         selected: None,
         winner: None,
+    });
+    commands.insert_resource(TurnTimer {
+        remaining_time: 30.0,
     });
 
     commands.spawn((
@@ -405,6 +477,7 @@ fn setup_game(mut commands: Commands, settings: Res<TitleSettings>) {
             commands.spawn((
                 Text2d::new("1"),
                 TextFont {
+                    font: japanese_font(&asset_server),
                     font_size: FontSize::Px(CELL_SIZE * 0.32),
                     ..default()
                 },
@@ -415,6 +488,44 @@ fn setup_game(mut commands: Commands, settings: Res<TitleSettings>) {
             ));
         }
     }
+
+    commands.spawn((
+        Text2d::new("Time: 30.0"),
+        TextFont {
+            font: japanese_font(&asset_server),
+            font_size: FontSize::Px(40.0),
+            ..default()
+        },
+        TextColor(Color::srgb(1.0, 0.3, 0.3)),
+        Transform::from_xyz(0.0, board_pixel_height / 2.0 + 80.0, 10.0),
+        TimerText,
+        GameEntity,
+    ));
+
+    let my_color_text = match (mode.0, local_player.side) {
+        (GameMode::Cpu(difficulty), Some(PlayerTurn::First)) => {
+            format!("あなた: 先手 / CPU: {}", difficulty.label())
+        }
+        (GameMode::Cpu(difficulty), Some(PlayerTurn::Second)) => {
+            format!("あなた: 後手 / CPU: {}", difficulty.label())
+        }
+        (GameMode::OnlinePlayer, Some(PlayerTurn::First)) => "あなた: 先手 / 対人戦".to_string(),
+        (GameMode::OnlinePlayer, Some(PlayerTurn::Second)) => "あなた: 後手 / 対人戦".to_string(),
+        _ => "対戦中".to_string(),
+    };
+
+    commands.spawn((
+        Text2d::new(my_color_text),
+        TextFont {
+            font: japanese_font(&asset_server),
+            font_size: FontSize::Px(30.0),
+            ..default()
+        },
+        TextColor(Color::WHITE),
+        Transform::from_xyz(0.0, -board_pixel_height / 2.0 - 80.0, 10.0),
+        PlayerInfoText,
+        GameEntity,
+    ));
 
     commands.spawn((
         Sprite::from_color(
@@ -430,6 +541,7 @@ fn cleanup_game(
     mut commands: Commands,
     entities: Query<Entity, With<GameEntity>>,
     gameplay: Option<Res<Gameplay>>,
+    network_opt: Option<Res<NetworkChannels>>,
 ) {
     for entity in &entities {
         commands.entity(entity).despawn();
@@ -437,10 +549,13 @@ fn cleanup_game(
     if gameplay.is_some() {
         commands.remove_resource::<Gameplay>();
     }
-    // ネットワークリソースのお掃除
+    commands.remove_resource::<TurnTimer>();
+    if let Some(network) = network_opt {
+        let _ = network.stream.lock().unwrap().shutdown(Shutdown::Both);
+    }
     commands.remove_resource::<NetworkChannels>();
     commands.remove_resource::<LocalPlayer>();
-    commands.remove_resource::<SelectedNetworkMode>();
+    commands.remove_resource::<SelectedGameMode>();
 }
 
 fn handle_play_clicks(
@@ -449,14 +564,13 @@ fn handle_play_clicks(
     camera_q: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
     mut gameplay: ResMut<Gameplay>,
     local_player: Res<LocalPlayer>,
-    network_opt: Option<Res<NetworkChannels>>, // オフライン時は存在しない
-    mode: Res<SelectedNetworkMode>,
+    network_opt: Option<Res<NetworkChannels>>,
+    mut turn_timer: ResMut<TurnTimer>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) || gameplay.winner.is_some() {
         return;
     }
 
-    // オンライン対戦中かつ，自分のターンではない場合は入力を弾く
     if let Some(my_side) = local_player.side {
         if gameplay.turn != my_side {
             return;
@@ -486,52 +600,23 @@ fn handle_play_clicks(
             return;
         }
 
-        // ローカルで手を適用
         if gameplay.board.apply_move(selected, clicked_cell) {
             let current = gameplay.turn;
             gameplay.turn = gameplay.turn.next();
+            turn_timer.remaining_time = 30.0;
             gameplay.selected = None;
-            let is_done = !gameplay.board.has_legal_move();
             if !gameplay.board.has_legal_move() {
                 gameplay.winner = Some(current);
             }
 
-            // オンラインであれば，適用した手を相手に送信する
             if let Some(network) = network_opt {
-                let msg = GameMessage::Move {
-                    from_x: selected.x,
-                    from_y: selected.y,
-                    to_x: clicked_cell.x,
-                    to_y: clicked_cell.y,
-                };
-                let msg_turn = match local_player.side {
-                    Some(side) => GameMessage::Turn { side },
-                    None => GameMessage::Turn { side: current.next() }, // オフライン時は次の手番を送信
-                };
-                // Mutexをロックしてから送信する
                 if let Ok(tx) = network.tx.lock() {
-                    let _ = tx.send(msg);
-                    let _ = tx.send(msg_turn);
-
-                    if mode.0 == NetworkMode::PlayAgainstAI {
-                        // TODO: gameplay.boardの中身をフラットな配列に変換する
-                        // 例: 盤面サイズが4x3なら、12個の要素を持つVec<u8>を作る
-                        let mut board_state = Vec::new();
-                        for y in 0..gameplay.board.height() {
-                            for x in 0..gameplay.board.width() {
-                                let val = gameplay.board.stack_at(Position{x, y});
-                                board_state.push(val as u8);
-                            }
-                        }
-
-                        let msg_state = GameMessage::StateRequest {
-                            board_state,
-                            turn: gameplay.turn,
-                            is_done,
-                            winner: gameplay.winner,
-                        };
-                        let _ = tx.send(msg_state);
-                    }
+                    let _ = tx.send(GameMessage::Move {
+                        from_x: selected.x,
+                        from_y: selected.y,
+                        to_x: clicked_cell.x,
+                        to_y: clicked_cell.y,
+                    });
                 }
             }
             return;
@@ -545,67 +630,383 @@ fn handle_play_clicks(
     }
 }
 
-// ----------------------------------------------------------------
-// ネットワークからの受信処理
-// ----------------------------------------------------------------
 fn handle_network_messages(
+    mut commands: Commands,
     mut gameplay: ResMut<Gameplay>,
     network_opt: Option<Res<NetworkChannels>>,
-    // mode: Res<SelectedNetworkMode>,
+    mut turn_timer: ResMut<TurnTimer>,
+    mut settings: ResMut<TitleSettings>,
+    mut local_player: ResMut<LocalPlayer>,
+    mut next_state: ResMut<NextState<AppState>>,
 ) {
     let Some(network) = network_opt else { return; };
-
-    // Mutexをロックして Receiver にアクセス
     let Ok(rx) = network.rx.lock() else { return; };
 
-    // キューに溜まっているすべてのメッセージを処理する
     while let Ok(msg) = rx.try_recv() {
         match msg {
-            GameMessage::Move { from_x, from_y, to_x, to_y } => {
-                let from = Position { x: from_x, y: from_y };
+            GameMessage::Move {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            } => {
+                let from = Position {
+                    x: from_x,
+                    y: from_y,
+                };
                 let to = Position { x: to_x, y: to_y };
 
-                // 受信した手で盤面を更新
                 if gameplay.board.apply_move(from, to) {
                     let current = gameplay.turn;
                     gameplay.turn = gameplay.turn.next();
+                    turn_timer.remaining_time = 30.0;
                     gameplay.selected = None;
                     if !gameplay.board.has_legal_move() {
                         gameplay.winner = Some(current);
                     }
                 }
             }
-            GameMessage::Turn { side } => {
-                // 受信した手番情報でターンを更新
-                gameplay.turn = side.next();
+            GameMessage::MatchStarted {
+                side,
+                board_width,
+                board_height,
+            } => {
+                local_player.side = Some(side);
+                settings.board_width = board_width;
+                settings.board_height = board_height;
+                reset_match(&mut gameplay, &mut turn_timer);
             }
-            GameMessage::StateRequest { board_state, turn, is_done, winner } => {
-                // AIからの盤面状態を受信して更新
-                let width = gameplay.board.width();
-                let height = gameplay.board.height();
-                if board_state.len() == width * height {
-                    for y in 0..height {
-                        for x in 0..width {
-                            let pos = Position { x, y };
-                            let val = board_state[y * width + x] as usize;
-                            gameplay.board.set_stack_at(pos, val);
-                        }
-                    }
-                    gameplay.turn = turn;
-                    if is_done {
-                        gameplay.winner = winner;
-                    }
+            GameMessage::RematchDecision { continue_playing } => {
+                if continue_playing {
+                    reset_match(&mut gameplay, &mut turn_timer);
+                } else {
+                    let _ = network.stream.lock().unwrap().shutdown(Shutdown::Both);
+                    commands.remove_resource::<NetworkChannels>();
+                    commands.remove_resource::<LocalPlayer>();
+                    commands.remove_resource::<SelectedGameMode>();
+                    next_state.set(AppState::Title);
                 }
             }
+            GameMessage::OpponentDisconnected => {
+                let _ = network.stream.lock().unwrap().shutdown(Shutdown::Both);
+                commands.remove_resource::<NetworkChannels>();
+                commands.remove_resource::<LocalPlayer>();
+                commands.remove_resource::<SelectedGameMode>();
+                next_state.set(AppState::Title);
+            }
+            GameMessage::WaitingForOpponent => {}
+        }
+    }
+}
+
+fn cpu_take_turn(
+    mut gameplay: ResMut<Gameplay>,
+    mode: Res<SelectedGameMode>,
+    local_player: Res<LocalPlayer>,
+    mut turn_timer: ResMut<TurnTimer>,
+) {
+    let GameMode::Cpu(difficulty) = mode.0 else {
+        return;
+    };
+    let Some(human_side) = local_player.side else {
+        return;
+    };
+    let cpu_side = human_side.next();
+    if gameplay.winner.is_some() || gameplay.turn != cpu_side {
+        return;
+    }
+
+    let Some((from, to)) = choose_cpu_move_via_agent(&gameplay.board, difficulty) else {
+        gameplay.winner = Some(human_side);
+        return;
+    };
+
+    if gameplay.board.apply_move(from, to) {
+        let current = gameplay.turn;
+        gameplay.turn = gameplay.turn.next();
+        turn_timer.remaining_time = 30.0;
+        gameplay.selected = None;
+        if !gameplay.board.has_legal_move() {
+            gameplay.winner = Some(current);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn choose_cpu_move_via_agent(
+    board: &GameBoard,
+    difficulty: CpuDifficulty,
+) -> Option<(Position, Position)> {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/rl_agent/cpu_move.py");
+    let script_dir = script_path.parent().unwrap().to_path_buf();
+    let board_state = board_state_json(board);
+    let difficulty_arg = match difficulty {
+        CpuDifficulty::Weak => "weak",
+        CpuDifficulty::Medium => "medium",
+        CpuDifficulty::Strong => "strong",
+    };
+
+    let output = match Command::new("uv")
+        .current_dir(&script_dir)
+        .args([
+            "run",
+            "python",
+            "cpu_move.py",
+            "--agent_name",
+            "AlphaStomper",
+            "--width",
+        ])
+        .arg(board.width().to_string())
+        .args(["--height"])
+        .arg(board.height().to_string())
+        .args(["--difficulty"])
+        .arg(difficulty_arg)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(board_state.as_bytes());
+            }
+            child.wait_with_output().ok()
+        }) {
+        Some(output) => output,
+        None => return choose_cpu_move_fallback(board),
+    };
+
+    if !output.status.success() {
+        eprintln!(
+            "CPU agent failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return choose_cpu_move_fallback(board);
+    }
+
+    let response = String::from_utf8(output.stdout).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&response).ok()?;
+    let from = Position {
+        x: parsed.get("from_x")?.as_u64()? as usize,
+        y: parsed.get("from_y")?.as_u64()? as usize,
+    };
+    let to = Position {
+        x: parsed.get("to_x")?.as_u64()? as usize,
+        y: parsed.get("to_y")?.as_u64()? as usize,
+    };
+    Some((from, to))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn choose_cpu_move_via_agent(
+    board: &GameBoard,
+    difficulty: CpuDifficulty,
+) -> Option<(Position, Position)> {
+    choose_cpu_move(board, difficulty)
+}
+
+fn choose_cpu_move_fallback(board: &GameBoard) -> Option<(Position, Position)> {
+    choose_cpu_move(board, CpuDifficulty::Weak)
+}
+
+fn board_state_json(board: &GameBoard) -> String {
+    let mut values = Vec::with_capacity(board.width() * board.height());
+    for y in 0..board.height() {
+        for x in 0..board.width() {
+            values.push(board.stack_at(Position { x, y }) as u8);
+        }
+    }
+    serde_json::json!({
+        "width": board.width(),
+        "height": board.height(),
+        "board_state": values,
+    })
+    .to_string()
+}
+
+fn choose_cpu_move(
+    board: &GameBoard,
+    difficulty: CpuDifficulty,
+) -> Option<(Position, Position)> {
+    let moves = board.legal_moves();
+    if moves.is_empty() {
+        return None;
+    }
+
+    let mut rng = thread_rng();
+    match difficulty {
+        CpuDifficulty::Weak => moves.choose(&mut rng).copied(),
+        CpuDifficulty::Medium => {
+            let scored = moves
+                .into_iter()
+                .map(|(from, to)| ((from, to), score_move(board, from, to)))
+                .collect::<Vec<_>>();
+            let min_opponent = scored.iter().map(|(_, score)| score.opponent_moves).min()?;
+            let mut best = scored
+                .into_iter()
+                .filter(|(_, score)| score.opponent_moves == min_opponent)
+                .collect::<Vec<_>>();
+            best.shuffle(&mut rng);
+            best.first().map(|(mv, _)| *mv)
+        }
+        CpuDifficulty::Strong => moves
+            .into_iter()
+            .max_by_key(|(from, to)| {
+                let score = score_move(board, *from, *to);
+                (
+                    Reverse(score.opponent_moves),
+                    score.resulting_stack,
+                    score.moving_stack,
+                )
+            }),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MoveScore {
+    opponent_moves: usize,
+    resulting_stack: u32,
+    moving_stack: u32,
+}
+
+fn score_move(board: &GameBoard, from: Position, to: Position) -> MoveScore {
+    let moving_stack = board.stack_at(from);
+    let resulting_stack = moving_stack + board.stack_at(to);
+    let mut next_board = board.clone();
+    let _ = next_board.apply_move(from, to);
+    MoveScore {
+        opponent_moves: next_board.legal_moves().len(),
+        resulting_stack,
+        moving_stack,
+    }
+}
+
+fn rematch_prompt_keyboard_shortcuts(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mode: Option<Res<SelectedGameMode>>,
+    mut gameplay: ResMut<Gameplay>,
+    local_player: Option<Res<LocalPlayer>>,
+    network_opt: Option<Res<NetworkChannels>>,
+    mut commands: Commands,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut turn_timer: ResMut<TurnTimer>,
+) {
+    let Some(mode) = mode else { return; };
+    if !matches!(mode.0, GameMode::OnlinePlayer) {
+        return;
+    }
+
+    let Some(local_player) = local_player else { return; };
+    let Some(winner) = gameplay.winner else { return; };
+    if local_player.side == Some(winner) {
+        return;
+    }
+
+    if keyboard.just_pressed(KeyCode::KeyC) || keyboard.just_pressed(KeyCode::Enter) {
+        if let Some(network) = network_opt {
+            if let Ok(tx) = network.tx.lock() {
+                let _ = tx.send(GameMessage::RematchDecision {
+                    continue_playing: true,
+                });
+            }
+        }
+        reset_match(&mut gameplay, &mut turn_timer);
+    } else if keyboard.just_pressed(KeyCode::KeyQ) || keyboard.just_pressed(KeyCode::Escape) {
+        if let Some(network) = network_opt {
+            if let Ok(tx) = network.tx.lock() {
+                let _ = tx.send(GameMessage::RematchDecision {
+                    continue_playing: false,
+                });
+            }
+            let _ = network.stream.lock().unwrap().shutdown(Shutdown::Both);
+        }
+        commands.remove_resource::<NetworkChannels>();
+        commands.remove_resource::<LocalPlayer>();
+        commands.remove_resource::<SelectedGameMode>();
+        next_state.set(AppState::Title);
+    }
+}
+
+fn sync_rematch_prompt(
+    mut commands: Commands,
+    gameplay: Option<Res<Gameplay>>,
+    local_player: Option<Res<LocalPlayer>>,
+    mode: Option<Res<SelectedGameMode>>,
+    prompt_entities: Query<Entity, With<RematchPrompt>>,
+    asset_server: Res<AssetServer>,
+) {
+    let should_show = matches!(mode.as_deref(), Some(mode) if matches!(mode.0, GameMode::OnlinePlayer))
+        && matches!(gameplay.as_deref(), Some(gameplay) if gameplay.winner.is_some())
+        && local_player.is_some();
+
+    if should_show {
+        if prompt_entities.is_empty() {
+            let gameplay = gameplay.as_ref().unwrap();
+            let local_player = local_player.as_ref().unwrap();
+            let winner = gameplay.winner.unwrap();
+            let board_pixel_height = board_extent(gameplay.board.height());
+            let status = if local_player.side == Some(winner) {
+                "相手の選択を待っています"
+            } else {
+                "C: 続ける / Q: やめる"
+            };
+
+            commands.spawn((
+                Sprite::from_color(Color::srgba(0.0, 0.0, 0.0, 0.55), Vec2::new(700.0, 170.0)),
+                Transform::from_xyz(0.0, board_pixel_height / 2.0 + 20.0, 20.0),
+                RematchPrompt,
+                GameEntity,
+            ));
+            commands.spawn((
+                Text2d::new("対局終了"),
+                TextFont {
+                    font: japanese_font(&asset_server),
+                    font_size: FontSize::Px(34.0),
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                Transform::from_xyz(0.0, board_pixel_height / 2.0 + 70.0, 25.0),
+                RematchPrompt,
+                GameEntity,
+            ));
+            commands.spawn((
+                Text2d::new(status),
+                TextFont {
+                    font: japanese_font(&asset_server),
+                    font_size: FontSize::Px(28.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.95, 0.9, 0.35)),
+                Transform::from_xyz(0.0, board_pixel_height / 2.0 + 20.0, 25.0),
+                RematchPrompt,
+                GameEntity,
+            ));
+        }
+    } else {
+        for entity in &prompt_entities {
+            commands.entity(entity).despawn();
         }
     }
 }
 
 fn playing_keyboard_shortcuts(
     keyboard: Res<ButtonInput<KeyCode>>,
+    mode: Option<Res<SelectedGameMode>>,
+    gameplay: Res<Gameplay>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
-    if keyboard.just_pressed(KeyCode::KeyR) || keyboard.just_pressed(KeyCode::Escape) {
+    if let Some(mode) = mode {
+        if matches!(mode.0, GameMode::Cpu(_))
+            && gameplay.winner.is_some()
+            && (keyboard.just_pressed(KeyCode::KeyR) || keyboard.just_pressed(KeyCode::Escape))
+        {
+            next_state.set(AppState::Title);
+        }
+    }
+
+    if gameplay.winner.is_none()
+        && (keyboard.just_pressed(KeyCode::KeyR) || keyboard.just_pressed(KeyCode::Escape))
+    {
         next_state.set(AppState::Title);
     }
 }
@@ -646,29 +1047,23 @@ fn update_board_visuals(
     }
 }
 
-// 接続待機中のウィンドウタイトル更新
-fn update_connecting_window(
-    mut window: Single<&mut Window, With<PrimaryWindow>>,
-    mode: Res<SelectedNetworkMode>,
-) {
-    match mode.0 {
-        NetworkMode::Host => window.title = "クライアントの接続を待機中... (Escでキャンセル)".to_string(),
-        NetworkMode::Join => window.title = "サーバーに接続中... (Escでキャンセル)".to_string(),
-        NetworkMode::PlayAgainstAI => window.title = "AIの接続を待機中... (Escでキャンセル)".to_string(),
-        _ => {}
-    }
+fn update_connecting_window(mut window: Single<&mut Window, With<PrimaryWindow>>) {
+    window.title = "サーバーに接続中... (Escでキャンセル)".to_string();
 }
 
-// 接続待機中のキャンセル処理
 fn connecting_keyboard_shortcuts(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut next_state: ResMut<NextState<AppState>>,
     mut commands: Commands,
+    network_opt: Option<Res<NetworkChannels>>,
 ) {
     if keyboard.just_pressed(KeyCode::Escape) {
-        // リソースをお掃除してタイトルに戻る
         commands.remove_resource::<ConnectionReceiver>();
-        commands.remove_resource::<SelectedNetworkMode>();
+        if let Some(network) = network_opt {
+            let _ = network.stream.lock().unwrap().shutdown(Shutdown::Both);
+            commands.remove_resource::<NetworkChannels>();
+        }
+        commands.remove_resource::<SelectedGameMode>();
         commands.remove_resource::<LocalPlayer>();
         next_state.set(AppState::Title);
     }
@@ -681,26 +1076,50 @@ fn update_turn_highlight(
     query.color = gameplay.turn.tint();
 }
 
+fn update_turn_timer(
+    time: Res<Time>,
+    mut timer_res: ResMut<TurnTimer>,
+    mut timer_text_query: Query<&mut Text2d, With<TimerText>>,
+    gameplay: Res<Gameplay>,
+) {
+    if gameplay.winner.is_some() {
+        return;
+    }
+
+    timer_res.remaining_time -= time.delta_secs();
+    if timer_res.remaining_time <= 0.0 {
+        timer_res.remaining_time = 0.0;
+    }
+
+    for mut text in &mut timer_text_query {
+        text.0 = format!("Time: {:.1}", timer_res.remaining_time);
+    }
+}
+
 fn update_game_window_title(
     mut window: Single<&mut Window, With<PrimaryWindow>>,
     gameplay: Res<Gameplay>,
     local_player: Res<LocalPlayer>,
+    mode: Res<SelectedGameMode>,
 ) {
-    let mode_str = match local_player.side {
-        Some(PlayerTurn::First) => "[ホスト: あなたは先手]",
-        Some(PlayerTurn::Second) => "[参加者: あなたは後手]",
-        None => "[オフライン]",
+    let mode_str = match mode.0 {
+        GameMode::Cpu(difficulty) => format!("[{}]", difficulty.label()),
+        GameMode::OnlinePlayer => match local_player.side {
+            Some(PlayerTurn::First) => "[対人戦: あなたは先手]".to_string(),
+            Some(PlayerTurn::Second) => "[対人戦: あなたは後手]".to_string(),
+            None => "[対人戦]".to_string(),
+        },
     };
 
     if let Some(winner) = gameplay.winner {
         window.title = format!(
-            "Robber Game {} | {} の勝ち (Rでタイトルへ戻る)",
+            "Stomper Game {} | {} の勝ち",
             mode_str,
             winner.label()
         );
     } else {
         window.title = format!(
-            "Robber Game {} | {} の手番をハイライト中 (盤面 {}x{})",
+            "Stomper Game {} | {} の手番 (盤面 {}x{})",
             mode_str,
             gameplay.turn.label(),
             gameplay.board.width(),
@@ -733,4 +1152,72 @@ fn world_to_board(world: Vec2, width: usize, height: usize) -> Option<Position> 
         x: x as usize,
         y: y as usize,
     })
+}
+
+fn wait_for_opponent(
+    network_opt: Option<Res<NetworkChannels>>,
+    mut local_player: ResMut<LocalPlayer>,
+    mut settings: ResMut<TitleSettings>,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut commands: Commands,
+) {
+    let Some(network) = network_opt else { return; };
+    let Ok(rx) = network.rx.lock() else { return; };
+
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            GameMessage::MatchStarted {
+                side,
+                board_width,
+                board_height,
+            } => {
+                println!("🎉 マッチング成立！ あなたは {:?} です", side);
+                local_player.side = Some(side);
+                settings.board_width = board_width;
+                settings.board_height = board_height;
+                next_state.set(AppState::Playing);
+            }
+            GameMessage::OpponentDisconnected => {
+                let _ = network.stream.lock().unwrap().shutdown(Shutdown::Both);
+                commands.remove_resource::<NetworkChannels>();
+                commands.remove_resource::<SelectedGameMode>();
+                commands.remove_resource::<LocalPlayer>();
+                next_state.set(AppState::Title);
+            }
+            GameMessage::WaitingForOpponent => {}
+            GameMessage::Move { .. } | GameMessage::RematchDecision { .. } => {}
+        }
+    }
+}
+
+fn update_waiting_window(mut window: Single<&mut Window, With<PrimaryWindow>>) {
+    window.title = "対戦相手を待っています... (Escでキャンセル)".to_string();
+}
+
+fn waiting_keyboard_shortcuts(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut commands: Commands,
+    network_opt: Option<Res<NetworkChannels>>,
+) {
+    if keyboard.just_pressed(KeyCode::Escape) {
+        commands.remove_resource::<ConnectionReceiver>();
+        if let Some(network) = network_opt {
+            let _ = network.stream.lock().unwrap().shutdown(Shutdown::Both);
+            commands.remove_resource::<NetworkChannels>();
+        }
+        commands.remove_resource::<SelectedGameMode>();
+        commands.remove_resource::<LocalPlayer>();
+        next_state.set(AppState::Title);
+    }
+}
+
+fn reset_match(gameplay: &mut Gameplay, turn_timer: &mut TurnTimer) {
+    let width = gameplay.board.width();
+    let height = gameplay.board.height();
+    gameplay.board = GameBoard::new_filled(width, height);
+    gameplay.turn = PlayerTurn::First;
+    gameplay.selected = None;
+    gameplay.winner = None;
+    turn_timer.remaining_time = 30.0;
 }

@@ -179,9 +179,9 @@ fn start_network_connection(
 
     match mode_res.0 {
         GameMode::OnlinePlayer => {
-            println!("サーバー(172.192.161.164:8080)に接続中...");
+            println!("サーバー(127.0.0.1:8080)に接続中...");
             thread::spawn(move || {
-                if let Ok(stream) = TcpStream::connect("172.192.161.164:8080") {
+                if let Ok(stream) = TcpStream::connect("127.0.0.1:8080") {
                     println!("サーバーに接続しました！");
                     let _ = tx.send(stream);
                 }

@@ -52,7 +52,7 @@ fn parse_board_size() -> (usize, usize) {
 
 fn main() -> std::io::Result<()> {
     let (board_width, board_height) = parse_board_size();
-    let listener = TcpListener::bind("172.192.161.164:8080")?;
+    let listener = TcpListener::bind("0.0.0.0:8080")?;
     listener.set_nonblocking(true)?;
 
     println!("========================================");

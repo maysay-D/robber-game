@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::window::PrimaryWindow;
 use rand::{seq::SliceRandom, thread_rng};
 use std::cmp::Reverse;
@@ -20,17 +21,25 @@ use protocol::{CpuDifficulty, GameMessage, PlayerTurn};
 
 const CELL_SIZE: f32 = 72.0;
 
+fn player_color(player: PlayerTurn) -> Color {
+    match player {
+        PlayerTurn::First => Color::srgb(0.2, 0.55, 1.0),
+        PlayerTurn::Second => Color::srgb(1.0, 0.25, 0.25),
+    }
+}
+
 #[derive(States, Debug, Hash, Eq, PartialEq, Clone, Default)]
 enum AppState {
     #[default]
     Title,
+    EnterAddress,
     Connecting,
     WaitingForMatch,
     Playing,
 }
 
 #[derive(Resource)]
-struct ConnectionReceiver(Mutex<Receiver<TcpStream>>);
+struct ConnectionReceiver(Mutex<Receiver<Result<TcpStream, String>>>);
 
 #[derive(Resource)]
 struct TitleSettings {
@@ -49,6 +58,11 @@ struct SelectedGameMode(GameMode);
 
 #[derive(Resource)]
 struct TitleMenuSelection(usize);
+
+const DEFAULT_SERVER_ADDRESS: &str = "127.0.0.1:8080";
+
+#[derive(Resource)]
+struct ServerAddress(String);
 
 #[derive(Resource)]
 struct LocalPlayer {
@@ -90,6 +104,12 @@ struct MainCamera;
 struct TitleEntity;
 
 #[derive(Component)]
+struct AddressEntity;
+
+#[derive(Component)]
+struct AddressDisplayText;
+
+#[derive(Component)]
 struct GameEntity;
 
 #[derive(Component)]
@@ -118,6 +138,7 @@ fn main() {
             board_height: 1,
         })
         .insert_resource(TitleMenuSelection(0))
+        .insert_resource(ServerAddress(DEFAULT_SERVER_ADDRESS.to_string()))
         .add_plugins(DefaultPlugins)
         .init_state::<AppState>()
         .add_systems(Startup, setup_camera)
@@ -132,6 +153,17 @@ fn main() {
         )
         .add_systems(OnEnter(AppState::Title), enter_title)
         .add_systems(OnExit(AppState::Title), cleanup_title)
+        .add_systems(OnEnter(AppState::EnterAddress), enter_address_screen)
+        .add_systems(OnExit(AppState::EnterAddress), cleanup_address_screen)
+        .add_systems(
+            Update,
+            (
+                address_input_system,
+                update_address_display,
+                update_address_window,
+            )
+                .run_if(in_state(AppState::EnterAddress)),
+        )
         .add_systems(OnEnter(AppState::Connecting), start_network_connection)
         .add_systems(
             Update,
@@ -174,17 +206,21 @@ fn main() {
 fn start_network_connection(
     mut commands: Commands,
     mode_res: Res<SelectedGameMode>,
+    server_address: Res<ServerAddress>,
 ) {
     let (tx, rx) = mpsc::channel();
 
     match mode_res.0 {
         GameMode::OnlinePlayer => {
-            println!("サーバー(127.0.0.1:8080)に接続中...");
+            let address = normalize_address(&server_address.0);
+            println!("サーバー({address})に接続中...");
             thread::spawn(move || {
-                if let Ok(stream) = TcpStream::connect("127.0.0.1:8080") {
+                let result = TcpStream::connect(address.as_str())
+                    .map_err(|err| format!("サーバーへの接続に失敗しました: {err}"));
+                if result.is_ok() {
                     println!("サーバーに接続しました！");
-                    let _ = tx.send(stream);
                 }
+                let _ = tx.send(result);
             });
         }
         GameMode::Cpu(_) => unreachable!(),
@@ -199,16 +235,48 @@ fn start_network_connection(mut next_state: ResMut<NextState<AppState>>) {
     next_state.set(AppState::Title);
 }
 
+/// 入力された文字列を接続用の "host:port" 形式に正規化する。
+/// 空欄ならデフォルトのアドレスを、ポート未入力ならデフォルトポートを補う。
+fn normalize_address(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_SERVER_ADDRESS.to_string();
+    }
+    if trimmed.contains(':') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}:8080")
+    }
+}
+
 fn check_network_connection(
     mut commands: Commands,
     receiver: Option<Res<ConnectionReceiver>>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
     if let Some(receiver) = receiver {
-        if let Ok(stream) = receiver.0.lock().unwrap().try_recv() {
-            setup_tcp_threads(&mut commands, stream);
-            commands.remove_resource::<ConnectionReceiver>();
-            next_state.set(AppState::WaitingForMatch);
+        let result = receiver.0.lock().unwrap().try_recv();
+        match result {
+            Ok(Ok(stream)) => {
+                setup_tcp_threads(&mut commands, stream);
+                commands.remove_resource::<ConnectionReceiver>();
+                next_state.set(AppState::WaitingForMatch);
+            }
+            Ok(Err(err)) => {
+                eprintln!("{err}");
+                commands.remove_resource::<ConnectionReceiver>();
+                commands.remove_resource::<SelectedGameMode>();
+                commands.remove_resource::<LocalPlayer>();
+                next_state.set(AppState::Title);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                eprintln!("接続処理スレッドが予期せず終了しました");
+                commands.remove_resource::<ConnectionReceiver>();
+                commands.remove_resource::<SelectedGameMode>();
+                commands.remove_resource::<LocalPlayer>();
+                next_state.set(AppState::Title);
+            }
         }
     }
 }
@@ -336,7 +404,7 @@ fn title_input_system(
             3 => {
                 commands.insert_resource(SelectedGameMode(GameMode::OnlinePlayer));
                 commands.insert_resource(LocalPlayer { side: None });
-                next_state.set(AppState::Connecting);
+                next_state.set(AppState::EnterAddress);
             }
             _ => {}
         }
@@ -345,6 +413,134 @@ fn title_input_system(
 
 fn update_title_window(mut window: Single<&mut Window, With<PrimaryWindow>>) {
     window.title = "Stomper (1/2/3:CPU 4:Player vs Player)".to_string();
+}
+
+fn enter_address_screen(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    server_address: Res<ServerAddress>,
+) {
+    commands.spawn((
+        Sprite::from_color(Color::srgb(0.12, 0.12, 0.2), Vec2::new(5000.0, 5000.0)),
+        Transform::from_xyz(0.0, 0.0, -50.0),
+        AddressEntity,
+    ));
+
+    commands.spawn((
+        Text2d::new("接続先サーバーを入力"),
+        TextFont {
+            font: japanese_font(&asset_server),
+            font_size: FontSize::Px(40.0),
+            ..default()
+        },
+        TextColor(Color::WHITE),
+        Transform::from_xyz(0.0, 100.0, 10.0),
+        AddressEntity,
+    ));
+
+    commands.spawn((
+        Text2d::new("英数字・.・:・- が入力できます (例 192.168.1.10:8080)"),
+        TextFont {
+            font: japanese_font(&asset_server),
+            font_size: FontSize::Px(22.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.8, 0.8, 0.8)),
+        Transform::from_xyz(0.0, 55.0, 10.0),
+        AddressEntity,
+    ));
+
+    commands.spawn((
+        Sprite::from_color(Color::srgb(0.18, 0.18, 0.24), Vec2::new(480.0, 60.0)),
+        Transform::from_xyz(0.0, -10.0, 5.0),
+        AddressEntity,
+    ));
+
+    commands.spawn((
+        Text2d::new(format!("{}_", server_address.0)),
+        TextFont {
+            font: japanese_font(&asset_server),
+            font_size: FontSize::Px(30.0),
+            ..default()
+        },
+        TextColor(Color::srgb(1.0, 0.92, 0.3)),
+        Transform::from_xyz(0.0, -10.0, 10.0),
+        AddressDisplayText,
+        AddressEntity,
+    ));
+
+    commands.spawn((
+        Text2d::new("Enter で接続 / BackSpace で削除 / Esc でキャンセル"),
+        TextFont {
+            font: japanese_font(&asset_server),
+            font_size: FontSize::Px(22.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.8, 0.8, 0.8)),
+        Transform::from_xyz(0.0, -100.0, 10.0),
+        AddressEntity,
+    ));
+}
+
+fn cleanup_address_screen(mut commands: Commands, query: Query<Entity, With<AddressEntity>>) {
+    for entity in &query {
+        commands.entity(entity).despawn();
+    }
+}
+
+fn address_input_system(
+    mut char_events: MessageReader<KeyboardInput>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut server_address: ResMut<ServerAddress>,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut commands: Commands,
+) {
+    for event in char_events.read() {
+        if !event.state.is_pressed() {
+            continue;
+        }
+
+        if let Key::Character(chars) = &event.logical_key {
+            for c in chars.chars() {
+                if (c.is_ascii_alphanumeric() || c == '.' || c == ':' || c == '-')
+                    && server_address.0.chars().count() < 64
+                {
+                    server_address.0.push(c);
+                }
+            }
+        }
+    }
+
+    if keyboard.just_pressed(KeyCode::Backspace) {
+        server_address.0.pop();
+    }
+
+    if keyboard.just_pressed(KeyCode::Enter) {
+        let trimmed = server_address.0.trim().to_string();
+        if !trimmed.is_empty() {
+            server_address.0 = trimmed;
+            next_state.set(AppState::Connecting);
+        }
+    }
+
+    if keyboard.just_pressed(KeyCode::Escape) {
+        commands.remove_resource::<SelectedGameMode>();
+        commands.remove_resource::<LocalPlayer>();
+        next_state.set(AppState::Title);
+    }
+}
+
+fn update_address_display(
+    server_address: Res<ServerAddress>,
+    mut query: Query<&mut Text2d, With<AddressDisplayText>>,
+) {
+    for mut text in &mut query {
+        text.0 = format!("{}_", server_address.0);
+    }
+}
+
+fn update_address_window(mut window: Single<&mut Window, With<PrimaryWindow>>) {
+    window.title = "接続先アドレスを入力 (Enterで接続 / Escでキャンセル)".to_string();
 }
 
 fn setup_tcp_threads(commands: &mut Commands, stream: TcpStream) {
@@ -460,20 +656,33 @@ fn setup_game(
     for y in 0..board_height {
         for x in 0..board_width {
             let p = Position { x, y };
+
+            // マス
             commands.spawn((
-                Sprite::from_color(Color::srgb(0.23, 0.23, 0.23), Vec2::splat(CELL_SIZE - 3.0)),
-                Transform::from_translation(board_to_world(p, board_width, board_height, -10.0)),
+                Sprite::from_color(
+                    Color::srgb(0.23, 0.23, 0.23),
+                    Vec2::splat(CELL_SIZE - 3.0),
+                ),
+                Transform::from_translation(
+                    board_to_world(p, board_width, board_height, -10.0)
+                ),
                 Cell { position: p },
                 GameEntity,
             ));
 
             commands.spawn((
-                Sprite::from_color(Color::srgb(0.08, 0.08, 0.08), Vec2::splat(CELL_SIZE * 0.56)),
-                Transform::from_translation(board_to_world(p, board_width, board_height, 1.0)),
+                Sprite::from_color(
+                    Color::srgb(0.08, 0.08, 0.08),
+                    Vec2::splat(CELL_SIZE * 0.56),
+                ),
+                Transform::from_translation(
+                    board_to_world(p, board_width, board_height, 1.0)
+                ),
                 StoneVisual { position: p },
                 GameEntity,
             ));
 
+            // 石の個数
             commands.spawn((
                 Text2d::new("1"),
                 TextFont {
@@ -482,7 +691,9 @@ fn setup_game(
                     ..default()
                 },
                 TextColor(Color::srgb(0.93, 0.93, 0.93)),
-                Transform::from_translation(board_to_world(p, board_width, board_height, 3.0)),
+                Transform::from_translation(
+                    board_to_world(p, board_width, board_height, 3.0)
+                ),
                 StoneCountText { position: p },
                 GameEntity,
             ));
@@ -509,9 +720,19 @@ fn setup_game(
         (GameMode::Cpu(difficulty), Some(PlayerTurn::Second)) => {
             format!("あなた: 後手 / CPU: {}", difficulty.label())
         }
-        (GameMode::OnlinePlayer, Some(PlayerTurn::First)) => "あなた: 先手 / 対人戦".to_string(),
-        (GameMode::OnlinePlayer, Some(PlayerTurn::Second)) => "あなた: 後手 / 対人戦".to_string(),
+        (GameMode::OnlinePlayer, Some(PlayerTurn::First)) => {
+            "あなた: 先手 / 対人戦".to_string()
+        }
+        (GameMode::OnlinePlayer, Some(PlayerTurn::Second)) => {
+            "あなた: 後手 / 対人戦".to_string()
+        }
         _ => "対戦中".to_string(),
+    };
+
+    let my_player_color = match local_player.side {
+        Some(PlayerTurn::First) => Color::srgb(0.2, 0.55, 1.0),
+        Some(PlayerTurn::Second) => Color::srgb(1.0, 0.25, 0.25),
+        None => Color::WHITE,
     };
 
     commands.spawn((
@@ -521,8 +742,12 @@ fn setup_game(
             font_size: FontSize::Px(30.0),
             ..default()
         },
-        TextColor(Color::WHITE),
-        Transform::from_xyz(0.0, -board_pixel_height / 2.0 - 80.0, 10.0),
+        TextColor(my_player_color),
+        Transform::from_xyz(
+            0.0,
+            -board_pixel_height / 2.0 - 80.0,
+            10.0,
+        ),
         PlayerInfoText,
         GameEntity,
     ));
@@ -794,7 +1019,15 @@ fn choose_cpu_move_via_agent(
         x: parsed.get("to_x")?.as_u64()? as usize,
         y: parsed.get("to_y")?.as_u64()? as usize,
     };
-    Some((from, to))
+
+    // 外部エージェントが不正な手を返した場合、そのまま返すと CPU が毎フレーム
+    // Python を再起動し続ける可能性がある。合法手か確認し、不正ならフォールバックする。
+    if board.legal_moves().contains(&(from, to)) {
+        Some((from, to))
+    } else {
+        eprintln!("CPU agent returned an illegal move: {from:?} -> {to:?}");
+        choose_cpu_move_fallback(board)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -821,7 +1054,7 @@ fn board_state_json(board: &GameBoard) -> String {
         "height": board.height(),
         "board_state": values,
     })
-    .to_string()
+        .to_string()
 }
 
 fn choose_cpu_move(
@@ -1020,7 +1253,7 @@ fn update_board_visuals(
     for (cell, mut sprite) in &mut cells {
         let mut color = Color::srgb(0.23, 0.23, 0.23);
         if gameplay.selected == Some(cell.position) {
-            color = Color::srgb(0.14, 0.6, 0.2);
+            color = player_color(gameplay.turn);
         }
         sprite.color = color;
     }
@@ -1073,13 +1306,16 @@ fn update_turn_highlight(
     gameplay: Res<Gameplay>,
     mut query: Single<&mut Sprite, With<TurnHighlight>>,
 ) {
-    query.color = gameplay.turn.tint();
+    query.color = match gameplay.turn {
+        PlayerTurn::First => Color::srgba(0.2, 0.55, 1.0, 0.14),
+        PlayerTurn::Second => Color::srgba(1.0, 0.25, 0.25, 0.14),
+    };
 }
 
 fn update_turn_timer(
     time: Res<Time>,
     mut timer_res: ResMut<TurnTimer>,
-    mut timer_text_query: Query<&mut Text2d, With<TimerText>>,
+    mut timer_text_query: Query<(&mut Text2d, &mut TextColor), With<TimerText>>,
     gameplay: Res<Gameplay>,
 ) {
     if gameplay.winner.is_some() {
@@ -1091,8 +1327,14 @@ fn update_turn_timer(
         timer_res.remaining_time = 0.0;
     }
 
-    for mut text in &mut timer_text_query {
-        text.0 = format!("Time: {:.1}", timer_res.remaining_time);
+    for (mut text, mut color) in &mut timer_text_query {
+        text.0 = format!(
+            "{}の手番  Time: {:.1}",
+            gameplay.turn.label(),
+            timer_res.remaining_time
+        );
+
+        *color = TextColor(player_color(gameplay.turn));
     }
 }
 

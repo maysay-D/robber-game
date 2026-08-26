@@ -1,4 +1,4 @@
-# robber-game
+# Stomper
 
 ## 起動
 - `cargo run`
@@ -16,10 +16,13 @@
 - `src/rl_agent/train_offline.py` が `AlphaStomper_4x1_200.pkl` のような形式で保存
 
 ## 対人戦サーバー
-- `cargo run --bin robber-server -- <width> <height>`
+- サーバーの立ち上げは`cargo run --bin robber-server -- <width> <height>`
 - 例: `cargo run --bin robber-server -- 4 1`
+- クライアント接続時に「プレイヤーと対戦」を選択し，IPアドレスとポート番号（デフォルト: 8080）を入力
+  - デフォルトでは0.0.0.0アドレスを使用してサーバーを建てている
+    - 自分のPCであればlocalhost:8080を使用すれば接続できる
+    - 同じネットワーク内の他のPCから接続する場合は，サーバーを立ち上げたPCのIPアドレスを使用する（VPNも可）
 
-## Web配信について
-- ブラウザで動かす場合は、Rust クライアントを `wasm32-unknown-unknown` にビルドして静的配信します
-- その場合も対人戦は `robber-server` を別プロセスで起動します
-- CPU 戦は現状ローカルの Python エージェントを呼ぶため、ブラウザ単体ではなくサーバー側へ移す構成が必要です
+## TODO
+- 時間が0秒になったら対局を自動的に終了させる
+- サーバー側を閉じたら自動的にクライアントも閉じるようにする

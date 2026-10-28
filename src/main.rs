@@ -38,6 +38,7 @@ enum AppState {
 struct TitleSettings {
     board_width: usize,
     board_height: usize,
+    human_side: PlayerTurn,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +122,7 @@ fn main() {
         .insert_resource(TitleSettings {
             board_width: 4,
             board_height: 3,
+            human_side: PlayerTurn::First,
         })
         .insert_resource(TitleMenuSelection(0))
         .add_plugins(game_plugins())
@@ -240,6 +242,8 @@ fn web_action_key(action: &str) -> Option<KeyCode> {
         "enter" => KeyCode::Enter,
         "rematch" => KeyCode::KeyC,
         "title" => KeyCode::Escape,
+        "first" => KeyCode::KeyF,
+        "second" => KeyCode::KeyG,
         _ => return None,
     })
 }
@@ -336,7 +340,7 @@ fn enter_title(
 
     commands.spawn((
         Text2d::new(
-            "CPU戦はあなたが先手 / 対人戦は同じ端末で交互に操作",
+            "CPU戦は F / G で先手・後手を選択 / 対人戦は交互に操作",
         ),
         TextFont {
             font: japanese_font(&asset_server),
@@ -424,6 +428,14 @@ fn title_input_system(
         settings.board_height = height;
     }
 
+    if keyboard.just_pressed(KeyCode::KeyF) {
+        settings.human_side = PlayerTurn::First;
+    }
+
+    if keyboard.just_pressed(KeyCode::KeyG) {
+        settings.human_side = PlayerTurn::Second;
+    }
+
     if keyboard.just_pressed(KeyCode::Enter)
         || keyboard.just_pressed(KeyCode::Space)
     {
@@ -433,7 +445,7 @@ fn title_input_system(
                     GameMode::Cpu(CpuDifficulty::Weak),
                 ));
                 commands.insert_resource(LocalPlayer {
-                    side: Some(PlayerTurn::First),
+                    side: Some(settings.human_side),
                 });
                 next_state.set(AppState::Playing);
             }
@@ -442,7 +454,7 @@ fn title_input_system(
                     GameMode::Cpu(CpuDifficulty::Medium),
                 ));
                 commands.insert_resource(LocalPlayer {
-                    side: Some(PlayerTurn::First),
+                    side: Some(settings.human_side),
                 });
                 next_state.set(AppState::Playing);
             }
@@ -451,7 +463,7 @@ fn title_input_system(
                     GameMode::Cpu(CpuDifficulty::Strong),
                 ));
                 commands.insert_resource(LocalPlayer {
-                    side: Some(PlayerTurn::First),
+                    side: Some(settings.human_side),
                 });
                 next_state.set(AppState::Playing);
             }
@@ -495,9 +507,10 @@ fn update_board_size_text(
 ) {
     for mut text in &mut query {
         text.0 = format!(
-            "← → 盤面: {} × {}（3×3 ～ 5×4）",
+            "← → 盤面: {} × {}\nF: 先手 / G: 後手（あなた: {}）",
             settings.board_width,
             settings.board_height,
+            settings.human_side.label(),
         );
     }
 }
@@ -620,14 +633,19 @@ fn setup_game(
 
     let my_color_text = match mode.0 {
         GameMode::Cpu(difficulty) => {
+            let human_side = local_player
+                .side
+                .expect("CPU戦ではプレイヤーの手番が必要です");
+
             format!(
-                "あなた: 先手 / CPU: {}",
+                "あなた: {} / CPU: {}（{}）",
+                human_side.label(),
+                human_side.next().label(),
                 difficulty.label(),
             )
         }
         GameMode::LocalPlayers => {
-            "先手: プレイヤー1 / 後手: プレイヤー2"
-                .to_string()
+            "先手: プレイヤー1 / 後手: プレイヤー2".to_string()
         }
     };
 
